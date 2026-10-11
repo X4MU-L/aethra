@@ -1,0 +1,5 @@
+https://ekeboss.example.com
+https://ekeboss.example.com/menu
+https://ekeboss.example.com/reservations
+https://ekeboss.example.com/contact
+https://ekeboss.example.com/about
