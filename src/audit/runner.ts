@@ -4,19 +4,29 @@
  * Does NOT modify source files. Does NOT commit or push anything.
  */
 
-import path from 'path';
-import crypto from 'crypto';
-import os from 'os';
-import { writeJson, ensureDir, pathExists, readJson } from '../engine/fs.js';
-import { isPlaywrightAvailable, inspectPage, httpCheck, runLighthouse } from '../browser/engine.js';
-import { detectPlatformFromHttpSignals } from '../platforms/detector.js';
-import { updateTechnicalFindings } from '../engine/workspace.js';
-import { logger } from '../core/logger.js';
-import type { AuditRun, ClientConfig, Finding, EvidenceItem } from '../core/schemas.js';
-import { getVersion } from '../engine/subprocess.js';
+import path from "path";
+import crypto from "crypto";
+import os from "os";
+import { writeJson, ensureDir, pathExists, readJson } from "../engine/fs.js";
+import {
+  isPlaywrightAvailable,
+  inspectPage,
+  httpCheck,
+  runLighthouse,
+} from "../browser/engine.js";
+import { detectPlatformFromHttpSignals } from "../platforms/detector.js";
+import { updateTechnicalFindings } from "../engine/workspace.js";
+import { logger } from "../core/logger.js";
+import type {
+  AuditRun,
+  ClientConfig,
+  Finding,
+  EvidenceItem,
+} from "../core/schemas.js";
+import { getVersion } from "../engine/subprocess.js";
 
 export interface AuditOptions {
-  type?: 'baseline' | 'refresh' | 'local';
+  type?: "baseline" | "refresh" | "local";
   urlOverride?: string;
   maxPages?: number;
   timeoutMs?: number;
@@ -31,16 +41,18 @@ export async function runAudit(
   workspacePath: string,
   opts: AuditOptions = {},
 ): Promise<AuditRun> {
-  const auditId = crypto.randomBytes(8).toString('hex');
+  const auditId = crypto.randomBytes(8).toString("hex");
   const startedAt = new Date().toISOString();
-  const type = opts.type ?? 'baseline';
-  const evidenceDir = path.join(workspacePath, 'evidence');
-  // Local audits use a separate screenshot directory to avoid overwriting production evidence
-  const screenshotDir = type === 'local'
-    ? path.join(evidenceDir, 'screenshots', 'local')
-    : path.join(evidenceDir, 'screenshots');
-  const perfDir = path.join(evidenceDir, 'performance');
-  const accessDir = path.join(evidenceDir, 'accessibility');
+  const type = opts.type ?? "baseline";
+  const evidenceDir = path.join(workspacePath, "evidence");
+  // Use run-specific subdirectories to avoid overwriting evidence across audit types/runs
+  const screenshotDir = path.join(
+    evidenceDir,
+    "screenshots",
+    `${type}-${auditId}`,
+  );
+  const perfDir = path.join(evidenceDir, "performance");
+  const accessDir = path.join(evidenceDir, "accessibility");
 
   await ensureDir(screenshotDir);
   await ensureDir(perfDir);
@@ -49,12 +61,16 @@ export async function runAudit(
   // Resolve the audit URL: explicit override → local config (for 'local' type) → primary URL
   const auditUrl: string | undefined =
     opts.urlOverride ??
-    (type === 'local' ? (config.localUrl ?? config.primaryUrl) : config.primaryUrl);
+    (type === "local"
+      ? (config.localUrl ?? config.primaryUrl)
+      : config.primaryUrl);
 
   const playwrightAvailable = await isPlaywrightAvailable();
   const nodeVersion = process.version;
   const playwrightVersion = playwrightAvailable
-    ? (await getVersion('npx', 'playwright@latest --version').catch(() => null)) ?? undefined
+    ? ((await getVersion("npx", "playwright@latest --version").catch(
+        () => null,
+      )) ?? undefined)
     : undefined;
 
   const auditRun: AuditRun = {
@@ -62,7 +78,7 @@ export async function runAudit(
     clientSlug: config.slug,
     type,
     startedAt,
-    status: 'running',
+    status: "running",
     targetUrl: auditUrl,
     pagesInspected: [],
     findings: [],
@@ -73,29 +89,32 @@ export async function runAudit(
       os: `${os.type()} ${os.release()} (${os.arch()})`,
       nodeVersion,
       playwrightVersion,
-      note: type === 'local'
-        ? 'Local development audit. Results reflect local server state, not production.'
-        : 'Lab results only. Field data requires real user measurement.',
+      note:
+        type === "local"
+          ? "Local development audit. Results reflect local server state, not production."
+          : "Lab results only. Field data requires real user measurement.",
     },
   };
 
   if (!playwrightAvailable) {
     auditRun.limitations.push(
-      'Playwright not installed — screenshot capture and browser inspection unavailable. ' +
-      'Run: npm install playwright && npx playwright install chromium',
+      "Playwright not installed — screenshot capture and browser inspection unavailable. " +
+        "Run: npm install playwright && npx playwright install chromium",
     );
   }
 
   if (!auditUrl) {
-    if (type === 'local') {
+    if (type === "local") {
       auditRun.errors.push(
-        'No local URL configured. Run: aethra workspace set-local <url>  ' +
-        'or pass one directly: aethra audit --local http://localhost:3000',
+        "No local URL configured. Run: aethra workspace set-local <url>  " +
+          "or pass one directly: aethra audit --local http://localhost:3000",
       );
     } else {
-      auditRun.errors.push('No primary URL configured. Set primaryUrl in client.yaml.');
+      auditRun.errors.push(
+        "No primary URL configured. Set primaryUrl in client.yaml.",
+      );
     }
-    auditRun.status = 'partial';
+    auditRun.status = "partial";
     await saveAuditRun(auditRun, evidenceDir);
     return auditRun;
   }
@@ -104,20 +123,22 @@ export async function runAudit(
   logger.info(`HTTP check: ${auditUrl}`);
   const httpResult = await httpCheck(auditUrl, opts.timeoutMs ?? 15000);
   const httpEvidence: EvidenceItem = {
-    path: path.join(evidenceDir, 'logs', `http-check-${auditId}.json`),
-    type: 'http-check',
+    path: path.join(evidenceDir, "logs", `http-check-${auditId}.json`),
+    type: "http-check",
     description: `HTTP check for ${auditUrl}`,
     capturedAt: new Date().toISOString(),
     url: auditUrl,
   };
 
-  await ensureDir(path.join(evidenceDir, 'logs'));
+  await ensureDir(path.join(evidenceDir, "logs"));
   await writeJson(httpEvidence.path, httpResult);
   auditRun.artifactManifest.push(httpEvidence);
 
   if (!httpResult.reachable) {
-    auditRun.errors.push(`URL not reachable: ${httpResult.error ?? `HTTP ${httpResult.status}`}`);
-    auditRun.status = 'partial';
+    auditRun.errors.push(
+      `URL not reachable: ${httpResult.error ?? `HTTP ${httpResult.status}`}`,
+    );
+    auditRun.status = "partial";
     await saveAuditRun(auditRun, evidenceDir);
     return auditRun;
   }
@@ -129,15 +150,17 @@ export async function runAudit(
   // ── Stage 2: Platform detection from headers ──────────────────────────────
   const detection = detectPlatformFromHttpSignals(
     httpResult.headers ?? {},
-    '',
+    "",
     [],
   );
-  logger.info(`Platform detection: ${detection.platform} (${Math.round(detection.confidence * 100)}% confidence)`);
+  logger.info(
+    `Platform detection: ${detection.platform} (${Math.round(detection.confidence * 100)}% confidence)`,
+  );
 
   const detectionEvidence: EvidenceItem = {
-    path: path.join(evidenceDir, 'logs', `platform-detection-${auditId}.json`),
-    type: 'platform-detection',
-    description: 'Platform detection from HTTP headers',
+    path: path.join(evidenceDir, "logs", `platform-detection-${auditId}.json`),
+    type: "platform-detection",
+    description: "Platform detection from HTTP headers",
     capturedAt: new Date().toISOString(),
     url: auditUrl,
   };
@@ -145,21 +168,23 @@ export async function runAudit(
   auditRun.artifactManifest.push(detectionEvidence);
 
   if (detection.confidence > 0.5) {
-    auditRun.findings.push(buildFinding(
-      `Platform detected: ${detection.platform}`,
-      'platform',
-      'info',
-      `Detected platform is ${detection.platform} with ${Math.round(detection.confidence * 100)}% confidence.`,
-      detection.evidence,
-      detectionEvidence,
-    ));
+    auditRun.findings.push(
+      buildFinding(
+        `Platform detected: ${detection.platform}`,
+        "platform",
+        "info",
+        `Detected platform is ${detection.platform} with ${Math.round(detection.confidence * 100)}% confidence.`,
+        detection.evidence,
+        detectionEvidence,
+      ),
+    );
   }
 
   // ── Stage 3: Browser inspection ────────────────────────────────────────────
   // For local audits: only inspect the local URL (importantPages are production URLs)
   // For production audits: deduplicate importantPages against primaryUrl
   let targetPages: string[];
-  if (type === 'local') {
+  if (type === "local") {
     targetPages = [auditUrl];
   } else {
     const rawPages = [auditUrl, ...(config.auditSettings.importantPages ?? [])];
@@ -167,7 +192,7 @@ export async function runAudit(
     targetPages = rawPages
       .filter((u) => {
         // Normalise trailing slash for deduplication
-        const normalised = u.replace(/\/$/, '');
+        const normalised = u.replace(/\/$/, "");
         if (seenUrls.has(normalised)) return false;
         seenUrls.add(normalised);
         return true;
@@ -184,18 +209,20 @@ export async function runAudit(
           screenshotDir,
           { timeoutMs: opts.timeoutMs ?? 30000 },
           config.auditSettings.viewports ?? [
-            { name: 'desktop', width: 1440, height: 900 },
-            { name: 'mobile', width: 375, height: 812 },
+            { name: "desktop", width: 1440, height: 900 },
+            { name: "mobile", width: 375, height: 812 },
           ],
         );
 
         auditRun.pagesInspected.push(pageUrl);
 
         // Add screenshot evidence
-        for (const [viewportName, screenshotPath] of Object.entries(inspection.screenshots)) {
+        for (const [viewportName, screenshotPath] of Object.entries(
+          inspection.screenshots,
+        )) {
           auditRun.artifactManifest.push({
             path: screenshotPath,
-            type: 'screenshot',
+            type: "screenshot",
             description: `${viewportName} screenshot of ${pageUrl}`,
             capturedAt: new Date().toISOString(),
             url: pageUrl,
@@ -206,14 +233,14 @@ export async function runAudit(
         // Add page inspection evidence
         const inspectionPath = path.join(
           evidenceDir,
-          'browser-tests',
+          "browser-tests",
           `page-inspection-${sanitiseForFilename(pageUrl)}-${auditId}.json`,
         );
-        await ensureDir(path.join(evidenceDir, 'browser-tests'));
+        await ensureDir(path.join(evidenceDir, "browser-tests"));
         await writeJson(inspectionPath, inspection);
         auditRun.artifactManifest.push({
           path: inspectionPath,
-          type: 'browser-test',
+          type: "browser-test",
           url: pageUrl,
           capturedAt: new Date().toISOString(),
         });
@@ -222,24 +249,28 @@ export async function runAudit(
         if (inspection.title) {
           const htmlDetection = detectPlatformFromHttpSignals(
             {},
-            inspection.h1.join(' '),
+            inspection.h1.join(" "),
             [],
           );
           if (htmlDetection.confidence > detection.confidence) {
-            logger.info(`Updated platform detection from HTML: ${htmlDetection.platform}`);
+            logger.info(
+              `Updated platform detection from HTML: ${htmlDetection.platform}`,
+            );
           }
         }
 
         // Collect findings from console errors
         if (inspection.consoleErrors.length > 0) {
-          auditRun.findings.push(buildFinding(
-            `Console errors on ${pageUrl}`,
-            'technical',
-            inspection.consoleErrors.length > 5 ? 'high' : 'medium',
-            `${inspection.consoleErrors.length} console error(s) detected.`,
-            inspection.consoleErrors.slice(0, 5),
-            { path: inspectionPath, type: 'browser-test', url: pageUrl },
-          ));
+          auditRun.findings.push(
+            buildFinding(
+              `Console errors on ${pageUrl}`,
+              "technical",
+              inspection.consoleErrors.length > 5 ? "high" : "medium",
+              `${inspection.consoleErrors.length} console error(s) detected.`,
+              inspection.consoleErrors.slice(0, 5),
+              { path: inspectionPath, type: "browser-test", url: pageUrl },
+            ),
+          );
         }
 
         // Add artificial delay between pages (rate limiting)
@@ -260,7 +291,7 @@ export async function runAudit(
     if (lhResult.success && lhResult.reportPath) {
       auditRun.artifactManifest.push({
         path: lhResult.reportPath,
-        type: 'lighthouse',
+        type: "lighthouse",
         description: `Lighthouse audit of ${auditUrl}`,
         capturedAt: new Date().toISOString(),
         url: auditUrl,
@@ -272,23 +303,35 @@ export async function runAudit(
         // Generate findings from poor scores
         for (const [category, score] of Object.entries(lhResult.scores)) {
           if (score < 50) {
-            auditRun.findings.push(buildFinding(
-              `Poor Lighthouse ${category} score: ${score}/100`,
-              'performance',
-              'high',
-              `Lighthouse ${category} score is ${score}/100. Lab environment; field data may differ.`,
-              [`Score: ${score}/100`],
-              { path: lhResult.reportPath, type: 'lighthouse', url: auditUrl },
-            ));
+            auditRun.findings.push(
+              buildFinding(
+                `Poor Lighthouse ${category} score: ${score}/100`,
+                "performance",
+                "high",
+                `Lighthouse ${category} score is ${score}/100. Lab environment; field data may differ.`,
+                [`Score: ${score}/100`],
+                {
+                  path: lhResult.reportPath,
+                  type: "lighthouse",
+                  url: auditUrl,
+                },
+              ),
+            );
           } else if (score < 75) {
-            auditRun.findings.push(buildFinding(
-              `Below-target Lighthouse ${category} score: ${score}/100`,
-              'performance',
-              'medium',
-              `Lighthouse ${category} score is ${score}/100. Consider reviewing.`,
-              [`Score: ${score}/100`],
-              { path: lhResult.reportPath, type: 'lighthouse', url: auditUrl },
-            ));
+            auditRun.findings.push(
+              buildFinding(
+                `Below-target Lighthouse ${category} score: ${score}/100`,
+                "performance",
+                "medium",
+                `Lighthouse ${category} score is ${score}/100. Consider reviewing.`,
+                [`Score: ${score}/100`],
+                {
+                  path: lhResult.reportPath,
+                  type: "lighthouse",
+                  url: auditUrl,
+                },
+              ),
+            );
           }
         }
       }
@@ -300,30 +343,55 @@ export async function runAudit(
 
   // ── Complete ───────────────────────────────────────────────────────────────
   auditRun.completedAt = new Date().toISOString();
-  auditRun.status = auditRun.errors.length > 0 ? 'partial' : 'completed';
+  auditRun.status = auditRun.errors.length > 0 ? "partial" : "completed";
 
   await saveAuditRun(auditRun, evidenceDir);
+
+  // Dual-write to SQLite for indexed queries
+  try {
+    const { getDb, dbSaveAuditRun, dbSaveFindings } =
+      await import("../engine/db.js");
+    const db = getDb(workspacePath);
+    dbSaveAuditRun(db, auditRun);
+    if (auditRun.findings.length > 0) {
+      dbSaveFindings(db, auditRun.id, auditRun.findings);
+    }
+  } catch {
+    // SQLite persistence is supplementary — don't fail the audit
+    logger.warn("Could not persist audit run to database");
+  }
 
   // Update knowledge/technical-findings.md with live results
   try {
     await updateTechnicalFindings(workspacePath, auditRun);
   } catch (err) {
-    logger.warn(`Could not update technical-findings.md: ${(err as Error).message}`);
+    logger.warn(
+      `Could not update technical-findings.md: ${(err as Error).message}`,
+    );
   }
 
-  logger.success(`Audit ${auditId} complete. ${auditRun.findings.length} findings. ${auditRun.artifactManifest.length} artifacts.`);
+  logger.success(
+    `Audit ${auditId} complete. ${auditRun.findings.length} findings. ${auditRun.artifactManifest.length} artifacts.`,
+  );
 
   return auditRun;
 }
 
 /** Save an audit run to the evidence directory. */
-async function saveAuditRun(run: AuditRun, evidenceDir: string): Promise<string> {
+async function saveAuditRun(
+  run: AuditRun,
+  evidenceDir: string,
+): Promise<string> {
   const runPath = path.join(evidenceDir, `audit-${run.id}.json`);
   await writeJson(runPath, run);
 
   // Also write/overwrite the latest baseline or refresh pointer
   const pointerPath = path.join(evidenceDir, `${run.type}.json`);
-  await writeJson(pointerPath, { auditId: run.id, path: runPath, completedAt: run.completedAt });
+  await writeJson(pointerPath, {
+    auditId: run.id,
+    path: runPath,
+    completedAt: run.completedAt,
+  });
 
   logger.debug(`Audit run saved: ${runPath}`);
   return runPath;
@@ -332,7 +400,7 @@ async function saveAuditRun(run: AuditRun, evidenceDir: string): Promise<string>
 /** Load the latest audit run of a given type. */
 export async function loadLatestAudit(
   evidenceDir: string,
-  type: 'baseline' | 'refresh' | 'local' = 'baseline',
+  type: "baseline" | "refresh" | "local" = "baseline",
 ): Promise<AuditRun | null> {
   const pointerPath = path.join(evidenceDir, `${type}.json`);
   if (!(await pathExists(pointerPath))) return null;
@@ -349,23 +417,23 @@ export async function loadLatestAudit(
 function buildFinding(
   title: string,
   category: string,
-  severity: Finding['severity'],
+  severity: Finding["severity"],
   description: string,
   evidenceList: string[],
   primaryEvidence: Partial<EvidenceItem>,
 ): Finding {
   return {
-    id: `finding-${crypto.randomBytes(4).toString('hex')}`,
+    id: `finding-${crypto.randomBytes(4).toString("hex")}`,
     category,
     severity,
     title,
     description,
-    status: 'observed',
+    status: "observed",
     evidence: [
       {
-        path: primaryEvidence.path ?? '',
-        type: primaryEvidence.type ?? 'browser-test',
-        description: evidenceList.join('; ').slice(0, 200),
+        path: primaryEvidence.path ?? "",
+        type: primaryEvidence.type ?? "browser-test",
+        description: evidenceList.join("; ").slice(0, 200),
         capturedAt: new Date().toISOString(),
         url: primaryEvidence.url,
         viewport: primaryEvidence.viewport,
@@ -379,8 +447,8 @@ function buildFinding(
 function sanitiseForFilename(url: string): string {
   try {
     const p = new URL(url);
-    return (p.hostname + p.pathname).replace(/[^a-zA-Z0-9]/g, '-').slice(0, 40);
+    return (p.hostname + p.pathname).replace(/[^a-zA-Z0-9]/g, "-").slice(0, 40);
   } catch {
-    return url.replace(/[^a-zA-Z0-9]/g, '-').slice(0, 40);
+    return url.replace(/[^a-zA-Z0-9]/g, "-").slice(0, 40);
   }
 }

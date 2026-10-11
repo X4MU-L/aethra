@@ -11,10 +11,26 @@ import {
   findTaskByPrefix,
   transitionTask,
 } from "../../engine/tasks.js";
-import { pathExists, readJson } from "../../engine/fs.js";
+import { pathExists, readJson, writeJson } from "../../engine/fs.js";
 import { logger } from "../../core/logger.js";
 import { toAethraError } from "../../core/errors.js";
-import type { ImplementationPlan } from "../../core/schemas.js";
+import type { ImplementationPlan, PlanStatus } from "../../core/schemas.js";
+
+/** Sync plan JSON + SQLite status when a task transitions. */
+async function syncPlanStatus(
+  workspacePath: string,
+  planPath: string,
+  newStatus: PlanStatus,
+): Promise<void> {
+  if (await pathExists(planPath)) {
+    const plan = await readJson<ImplementationPlan>(planPath);
+    plan.status = newStatus;
+    plan.updatedAt = new Date().toISOString();
+    await writeJson(planPath, plan);
+    const { getDb, dbSavePlanMeta } = await import("../../engine/db.js");
+    dbSavePlanMeta(getDb(workspacePath), plan, planPath);
+  }
+}
 
 const STATUS_ICON: Record<string, string> = {
   planned: chalk.gray("◌"),
@@ -245,16 +261,14 @@ export function registerTaskCommand(program: Command): void {
           process.exit(1);
         }
 
-        // Also update the plan JSON status to 'approved' for backward compat
+        // Sync plan JSON + SQLite with approval metadata
         if (await pathExists(t.planPath)) {
           const plan = await readJson<ImplementationPlan>(t.planPath);
           plan.status = "approved";
           plan.approvedBy = opts.by;
           plan.approvedAt = new Date().toISOString();
-          const { writeJson } = await import("../../engine/fs.js");
+          plan.updatedAt = new Date().toISOString();
           await writeJson(t.planPath, plan);
-
-          // Sync plan metadata to SQLite
           const { getDb, dbSavePlanMeta } = await import("../../engine/db.js");
           dbSavePlanMeta(getDb(workspacePath), plan, t.planPath);
         }
@@ -357,10 +371,111 @@ export function registerTaskCommand(program: Command): void {
           notes: opts.notes,
         });
 
+        await syncPlanStatus(workspacePath, t.planPath, "abandoned");
+
         console.log(chalk.bold.gray(`\n  Task abandoned: ${updated.title}\n`));
       } catch (err) {
         const e = toAethraError(err);
         logger.error(`task abandon failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  // ── task start ────────────────────────────────────────────────────────────
+  task
+    .command("start <id>")
+    .description("Mark a task as in-progress (start implementation)")
+    .option("--client <slug>", "Specify client by slug")
+    .option("--notes <text>", "Optional notes")
+    .action(async (id: string, opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+
+      try {
+        const { config, workspacePath } =
+          await resolveClientWorkspace(clientSlug);
+        const t = await findTaskByPrefix(workspacePath, id);
+
+        if (!t) {
+          logger.error(`Task not found: ${id}`);
+          process.exit(1);
+        }
+
+        if (t.status === "in-progress") {
+          console.log(
+            chalk.yellow(
+              `\n  Task ${t.id.slice(0, 8)} is already in-progress.\n`,
+            ),
+          );
+          return;
+        }
+
+        const updated = await transitionTask(
+          workspacePath,
+          t.id,
+          "in-progress",
+          { notes: opts.notes },
+        );
+
+        await syncPlanStatus(workspacePath, t.planPath, "in-progress");
+
+        console.log(chalk.bold.yellow(`\n  ▶ Task started\n`));
+        console.log(`  Task:    ${updated.title}`);
+        console.log(`  ID:      ${updated.id.slice(0, 8)}`);
+        console.log(`  Client:  ${config.name}`);
+        console.log(
+          chalk.gray(
+            `\n  When done: aethra verify --task ${updated.id.slice(0, 8)}\n`,
+          ),
+        );
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`task start failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  // ── task complete ─────────────────────────────────────────────────────────
+  task
+    .command("complete <id>")
+    .description("Mark a verified task as completed")
+    .option("--client <slug>", "Specify client by slug")
+    .option("--notes <text>", "Optional completion notes")
+    .action(async (id: string, opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+
+      try {
+        const { config, workspacePath } =
+          await resolveClientWorkspace(clientSlug);
+        const t = await findTaskByPrefix(workspacePath, id);
+
+        if (!t) {
+          logger.error(`Task not found: ${id}`);
+          process.exit(1);
+        }
+
+        if (t.status === "completed") {
+          console.log(
+            chalk.yellow(
+              `\n  Task ${t.id.slice(0, 8)} is already completed.\n`,
+            ),
+          );
+          return;
+        }
+
+        const updated = await transitionTask(workspacePath, t.id, "completed", {
+          notes: opts.notes,
+        });
+
+        await syncPlanStatus(workspacePath, t.planPath, "completed");
+
+        console.log(chalk.bold.green(`\n  ✓ Task completed\n`));
+        console.log(`  Task:    ${updated.title}`);
+        console.log(`  ID:      ${updated.id.slice(0, 8)}`);
+        console.log(`  Client:  ${config.name}`);
+        console.log(chalk.gray(`\n  Generate report: aethra report\n`));
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`task complete failed: ${e.message}`);
         process.exit(e.exitCode);
       }
     });

@@ -18,7 +18,7 @@ export interface AgentContext {
 }
 
 export interface AgentResult {
-  status: "completed" | "partial" | "failed" | "not-available";
+  status: "completed" | "partial" | "failed" | "not-available" | "prepared";
   agentName: string;
   instructionPath: string;
   outputLog?: string;

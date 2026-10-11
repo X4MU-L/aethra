@@ -39,9 +39,22 @@ export function registerPlanFixCommand(program: Command): void {
         console.log(chalk.bold.blue(`\n  Plan Fix — ${config.name}\n`));
         console.log(chalk.gray(`  Task: ${task}\n`));
 
-        // 1. Load evidence
+        // 1. Load evidence (optionally refresh first)
         const evidenceDir = path.join(workspacePath, "evidence");
-        const latestAudit = await loadLatestAudit(evidenceDir, "baseline");
+        let latestAudit = await loadLatestAudit(evidenceDir, "baseline");
+
+        if (opts.refreshAudit) {
+          const { runAudit } = await import("../../audit/runner.js");
+          logger.info("Running refresh audit before planning...");
+          const refreshAudit = await runAudit(config, workspacePath, {
+            type: "refresh",
+            maxPages: 5,
+            captureScreenshots: true,
+            runLighthouseAudit: true,
+          });
+          latestAudit = refreshAudit;
+          logger.info(`Refresh audit completed: ${refreshAudit.id}`);
+        }
 
         const evidenceBasis: EvidenceItem[] = [];
         const limitations: string[] = [];

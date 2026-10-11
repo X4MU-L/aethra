@@ -139,11 +139,10 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       };
     }
 
-    // For now, we prepare the context but do not auto-launch.
-    // Auto-launch requires interactive terminal support that may not be available.
+    // Context prepared but auto-launch requires interactive terminal support.
     // The instruction file is the primary deliverable.
     return {
-      status: "not-available",
+      status: "prepared",
       agentName: this.name,
       instructionPath,
       outputLog:
