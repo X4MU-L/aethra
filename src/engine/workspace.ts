@@ -16,6 +16,7 @@ export const WORKSPACE_DIRS = [
   'evidence/performance',
   'evidence/accessibility',
   'evidence/browser-tests',
+  'evidence/design-critiques',
   'evidence/logs',
   'plans',
   'tasks',
@@ -23,6 +24,9 @@ export const WORKSPACE_DIRS = [
   'skills',
   'scripts',
   'platform',
+  'feedback/sessions',
+  'feedback/items',
+  'feedback/screenshots',
   '.local',
 ];
 

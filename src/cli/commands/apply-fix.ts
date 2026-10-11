@@ -9,8 +9,11 @@ import path from 'path';
 import chalk from 'chalk';
 import { resolveClientWorkspace } from '../../config/manager.js';
 import { getGitStatus, createFeatureBranch } from '../../engine/git.js';
+import { queryOutput } from '../../engine/subprocess.js';
 import { readJson, pathExists } from '../../engine/fs.js';
-import { findTaskByPrefix, transitionTask } from '../../engine/tasks.js';
+import { findTaskByPrefix, transitionTask, updateTask } from '../../engine/tasks.js';
+import { getDefaultAdapter } from '../../agents/registry.js';
+import { selectSkillsForTask } from '../../engine/context.js';
 import { logger } from '../../core/logger.js';
 import { toAethraError, WorkspaceError } from '../../core/errors.js';
 import type { ImplementationPlan } from '../../core/schemas.js';
@@ -22,6 +25,7 @@ export function registerApplyFixCommand(program: Command): void {
     .option('--client <slug>', 'Specify client by slug')
     .option('--no-branch', 'Skip feature branch creation')
     .option('--dry-run', 'Validate plan and Git state without making changes')
+    .option('--force', 'Skip plan freshness warnings')
     .action(async (planArg: string, opts, cmd) => {
       const clientSlug = opts.client ?? cmd.parent?.opts()?.client;
 
@@ -137,15 +141,32 @@ export function registerApplyFixCommand(program: Command): void {
             console.log(chalk.yellow('\n  These changes will be preserved. The apply will work on a new branch.'));
           }
 
-          // Check for stale plan (simple check: if plan was created before recent commits)
-          if (plan.createdAt) {
-            const planDate = new Date(plan.createdAt);
-            const planAge = Date.now() - planDate.getTime();
-            if (planAge > 7 * 24 * 60 * 60 * 1000) {
-              logger.warn(
-                `Plan was created ${Math.round(planAge / (24 * 60 * 60 * 1000))} days ago. ` +
-                'Verify that assumptions are still valid before applying.',
-              );
+          // Check plan freshness against git state
+          if (!opts.force) {
+            if (plan.planSnapshot?.gitCommit) {
+              const currentHead = await queryOutput('git', ['rev-parse', 'HEAD'], { cwd: repoPath });
+              if (currentHead && currentHead !== plan.planSnapshot.gitCommit) {
+                const commitCount = await queryOutput('git', [
+                  'rev-list', '--count',
+                  `${plan.planSnapshot.gitCommit}..HEAD`,
+                ], { cwd: repoPath });
+                logger.warn(
+                  `Repository has ${commitCount ?? 'unknown'} new commit(s) since plan creation ` +
+                  `(plan: ${plan.planSnapshot.gitCommit.slice(0, 8)}, current: ${currentHead.slice(0, 8)}). ` +
+                  'Review whether plan assumptions are still valid. Use --force to skip.',
+                );
+              }
+            }
+
+            // Fallback: time-based check
+            if (plan.createdAt) {
+              const planAge = Date.now() - new Date(plan.createdAt).getTime();
+              if (planAge > 7 * 24 * 60 * 60 * 1000) {
+                logger.warn(
+                  `Plan was created ${Math.round(planAge / (24 * 60 * 60 * 1000))} days ago. ` +
+                  'Verify that assumptions are still valid. Use --force to skip.',
+                );
+              }
             }
           }
 
@@ -159,32 +180,61 @@ export function registerApplyFixCommand(program: Command): void {
           }
 
           // Create feature branch (if not skipped)
+          let branchName: string | undefined;
           if (opts.branch !== false && !gitStatus.hasUncommittedChanges) {
-            const branchName = `aethra/${plan.id.slice(0, 8)}-${
+            branchName = `aethra/${plan.id.slice(0, 8)}-${
               plan.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 30)
             }`;
             await createFeatureBranch(branchName, repoPath);
             plan.gitBranch = branchName;
 
-            // Persist branch name to task record
+            // Save branch name without transitioning to in-progress
+            // The task stays at 'approved' until implementation actually starts
             if (taskId) {
-              await transitionTask(workspacePath, taskId, 'in-progress', {
-                gitBranch: branchName,
-              });
+              await updateTask(workspacePath, taskId, { gitBranch: branchName });
             }
-          } else if (taskId) {
-            await transitionTask(workspacePath, taskId, 'in-progress');
           }
         }
 
-        // ─── Implementation delegation ───────────────────────────────────────
+        // ─── Agent adapter ───────────────────────────────────────────────────
 
-        console.log(chalk.bold.yellow('\n  ⚠ Implementation delegation\n'));
-        console.log('  The apply-fix command prepares the environment for implementation.');
-        console.log('  The actual code changes must be made by an AI agent or engineer.');
-        console.log('\n  To implement with Claude Code, run from the repository directory:');
-        console.log(chalk.cyan(`\n    cd ${repoPath ?? '<repository>'}`));
-        console.log(chalk.cyan(`    claude  # then reference the plan: ${resolvedPlanPath}\n`));
+        const adapter = getDefaultAdapter();
+        const repoPathResolved = config.repositoryPath ?? process.cwd();
+
+        // Select relevant skills for the task
+        const skillSelection = await selectSkillsForTask(
+          plan.taskDescription,
+          config.platform,
+          'implement',
+          path.join(workspacePath, 'skills'),
+        );
+
+        const agentResult = await adapter.launch({
+          plan,
+          planPath: resolvedPlanPath,
+          workspacePath,
+          repositoryPath: repoPathResolved,
+          gitBranch: plan.gitBranch,
+          skills: skillSelection.selectedSkills,
+          evidencePaths: plan.evidenceBasis.map((e) => e.path),
+          taskId,
+        }, { dryRun: opts.dryRun });
+
+        console.log(chalk.bold.yellow('\n  Implementation preparation\n'));
+        console.log(chalk.gray(`  Agent instructions: ${agentResult.instructionPath}`));
+
+        if (agentResult.status === 'not-available') {
+          console.log('\n  The actual code changes must be made by an AI agent or engineer.');
+          console.log('\n  To implement with Claude Code, run from the repository directory:');
+          console.log(chalk.cyan(`\n    cd ${repoPathResolved}`));
+          console.log(chalk.cyan(`    claude  # then reference: ${agentResult.instructionPath}\n`));
+        }
+
+        if (taskId) {
+          console.log('  To mark implementation as started:');
+          console.log(chalk.cyan(`    aethra task start ${taskId.slice(0, 8)}\n`));
+        }
+
         console.log('  After implementation, run:');
         const verifyCmd = taskId
           ? `aethra verify --task ${taskId.slice(0, 8)}`

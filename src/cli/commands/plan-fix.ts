@@ -10,11 +10,12 @@ import chalk from "chalk";
 import { resolveClientWorkspace } from "../../config/manager.js";
 import { loadLatestAudit } from "../../audit/runner.js";
 import { getGitStatus } from "../../engine/git.js";
+import { queryOutput } from "../../engine/subprocess.js";
 import { writeJson, writeFile, ensureDir } from "../../engine/fs.js";
 import { createTask } from "../../engine/tasks.js";
 import { logger } from "../../core/logger.js";
 import { toAethraError } from "../../core/errors.js";
-import type { ImplementationPlan, EvidenceItem } from "../../core/schemas.js";
+import type { ImplementationPlan, EvidenceItem, PlanSnapshot } from "../../core/schemas.js";
 
 export function registerPlanFixCommand(program: Command): void {
   program
@@ -91,7 +92,21 @@ export function registerPlanFixCommand(program: Command): void {
           dependencies: [],
           openQuestions: [],
           estimatedScope: undefined,
+          feedbackIds: [],
         };
+
+        // 3b. Record plan snapshot for freshness checking
+        if (config.repositoryPath && gitStatus?.isRepo) {
+          const headCommit = await queryOutput('git', ['rev-parse', 'HEAD'], {
+            cwd: config.repositoryPath,
+          });
+          const snapshot: PlanSnapshot = {
+            gitCommit: headCommit ?? undefined,
+            gitBranch: gitStatus.branch ?? undefined,
+            auditId: latestAudit?.id,
+          };
+          plan.planSnapshot = snapshot;
+        }
 
         // 4. Auto-generate acceptance criteria structure based on task keywords
         const taskLower = task.toLowerCase();

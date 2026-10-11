@@ -115,8 +115,17 @@ export function registerVerifyCommand(program: Command): void {
         }> = [];
 
         if (plan) {
+          // Guard against empty acceptance criteria (vacuous truth)
+          if (plan.acceptanceCriteria.length === 0) {
+            verificationResults.push({
+              criterion: 'Manual review required (no acceptance criteria defined)',
+              passed: null,
+              notes: 'Plan has no acceptance criteria. Engineer must manually verify and sign off.',
+            });
+          }
+
           for (const ac of plan.acceptanceCriteria) {
-            // Auto-verify what we can from the audit
+            // Auto-verify what we can from the audit and test results
             let passed: boolean | null = null;
             let notes = 'Manual verification required';
 
@@ -128,6 +137,19 @@ export function registerVerifyCommand(program: Command): void {
             if (ac.category === 'visual' && verifyAudit.artifactManifest.some((a) => a.type === 'screenshot')) {
               passed = null; // Visual comparison requires human or tool
               notes = 'Screenshots captured. Review for visual regressions.';
+            }
+
+            // Auto-verify test and behaviour criteria when test suite ran
+            if (ac.category === 'test' && testRun !== undefined) {
+              passed = testRun.passed;
+              notes = testRun.passed
+                ? `Test suite passed (${testRun.passedCount} passed, ${testRun.failedCount} failed)`
+                : `Test suite failed (${testRun.passedCount} passed, ${testRun.failedCount} failed)`;
+            }
+
+            if (ac.category === 'behaviour' && testRun !== undefined && testRun.passed) {
+              passed = true;
+              notes = `Automated tests passed — behaviour verified (${testRun.passedCount} tests)`;
             }
 
             verificationResults.push({
@@ -174,7 +196,9 @@ export function registerVerifyCommand(program: Command): void {
           const anyDefinitelyFailed =
             testsFailed || verificationResults.some((r) => r.passed === false);
           const allPassed =
-            !testsFailed && verificationResults.every((r) => r.passed === true);
+            !testsFailed &&
+            verificationResults.length > 0 &&
+            verificationResults.every((r) => r.passed === true);
           const newStatus = anyDefinitelyFailed ? 'in-progress' : allPassed ? 'completed' : 'verifying';
 
           await transitionTask(workspacePath, resolvedTaskId, newStatus, {

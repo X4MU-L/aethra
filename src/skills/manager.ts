@@ -158,7 +158,9 @@ export async function writeSkill(
   return filePath;
 }
 
-/** Copy Aethra skills to Claude Code's skills directory. */
+const AETHRA_SKILL_PREFIX = 'aethra--';
+
+/** Copy Aethra skills to Claude Code's skills directory with namespace prefix. */
 export async function syncSkillsToClaudeCode(
   sourceDir: string = AETHRA_SKILLS_DIR,
 ): Promise<void> {
@@ -173,9 +175,23 @@ export async function syncSkillsToClaudeCode(
 
   for (const skill of skills) {
     if (skill.metadata.status === 'deprecated') continue;
-    const destPath = path.join(CLAUDE_SKILLS_DIR, path.basename(skill.filePath));
+    const baseName = path.basename(skill.filePath);
+    const destFilename = `${AETHRA_SKILL_PREFIX}${baseName}`;
+    const destPath = path.join(CLAUDE_SKILLS_DIR, destFilename);
+
+    // Check if user has their own skill with the same base name (without prefix)
+    const userFilePath = path.join(CLAUDE_SKILLS_DIR, baseName);
+    if (await pathExists(userFilePath)) {
+      const content = await fs.readFile(userFilePath, 'utf8');
+      if (!content.includes('adapted_by: Aethra') && !content.includes('source: Aethra')) {
+        logger.warn(
+          `User skill "${baseName}" exists — Aethra version saved as "${destFilename}"`,
+        );
+      }
+    }
+
     await fs.copy(skill.filePath, destPath, { overwrite: true });
-    logger.success(`Synced skill to Claude Code: ${path.basename(skill.filePath)}`);
+    logger.success(`Synced skill to Claude Code: ${destFilename}`);
   }
 }
 

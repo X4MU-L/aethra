@@ -31,6 +31,16 @@ const server = new Server(
 // Workspace path — resolved from CLI arg or environment
 const workspacePath = process.argv[2] ?? process.env['AETHRA_WORKSPACE'] ?? process.cwd();
 
+// Validate workspace at startup
+const configCheckPath = path.join(workspacePath, 'client.yaml');
+fs.pathExists(configCheckPath).then((exists) => {
+  if (!exists) {
+    process.stderr.write(
+      `Warning: ${workspacePath} does not appear to be an Aethra workspace (no client.yaml found).\n`,
+    );
+  }
+});
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 const TOOLS: Tool[] = [
@@ -145,6 +155,39 @@ const TOOLS: Tool[] = [
       required: ['filename'],
     },
   },
+  {
+    name: 'aethra_list_tasks',
+    description:
+      'List all tasks in the workspace with their status, plan ID, and timestamps. ' +
+      'Tasks track the lifecycle of implementation plans.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['planned', 'approved', 'in-progress', 'verifying', 'completed', 'blocked', 'abandoned'],
+          description: 'Filter tasks by status',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'aethra_get_task',
+    description:
+      'Get the full details of a specific task including status, plan reference, ' +
+      'timestamps, git branch, and verification results.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        taskId: {
+          type: 'string',
+          description: 'Task ID or prefix (first 8+ characters)',
+        },
+      },
+      required: ['taskId'],
+    },
+  },
 ];
 
 // ─── Tool handlers ────────────────────────────────────────────────────────────
@@ -180,6 +223,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'aethra_get_knowledge':
         return await handleGetKnowledge(toolArgs['filename'] as string);
+
+      case 'aethra_list_tasks':
+        return await handleListTasks(toolArgs['status'] as string | undefined);
+
+      case 'aethra_get_task':
+        return await handleGetTask(toolArgs['taskId'] as string);
 
       default:
         return {
@@ -321,6 +370,8 @@ async function handleListPlans(status?: string) {
 async function handleGetPlan(planId: string) {
   if (!planId) return errorResult('planId is required');
 
+  const safePlanId = path.basename(planId);
+
   const plansDir = path.join(workspacePath, 'plans');
   if (!(await fs.pathExists(plansDir))) {
     return errorResult('plans/ directory not found');
@@ -330,11 +381,11 @@ async function handleGetPlan(planId: string) {
 
   // Try exact filename match, then ID partial match
   const planFile =
-    files.find((f) => f === planId || f === `${planId}.json`) ??
-    files.find((f) => f.endsWith('.json') && f.includes(planId));
+    files.find((f) => f === safePlanId || f === `${safePlanId}.json`) ??
+    files.find((f) => f.endsWith('.json') && f.includes(safePlanId));
 
   if (!planFile) {
-    return errorResult(`Plan not found: ${planId}. Use aethra_list_plans to see available plans.`);
+    return errorResult(`Plan not found: ${safePlanId}. Use aethra_list_plans to see available plans.`);
   }
 
   const plan = await fs.readJson(path.join(plansDir, planFile)) as ImplementationPlan;
@@ -403,6 +454,71 @@ async function handleGetKnowledge(filename: string) {
 
   const content = await fs.readFile(knowledgePath, 'utf8');
   return { content: [{ type: 'text' as const, text: content }] };
+}
+
+async function handleListTasks(status?: string) {
+  const tasksRoot = path.join(workspacePath, 'tasks');
+  if (!(await fs.pathExists(tasksRoot))) {
+    return { content: [{ type: 'text' as const, text: JSON.stringify({ tasks: [] }) }] };
+  }
+
+  const entries = await fs.readdir(tasksRoot);
+  const tasks: Array<{
+    id: string;
+    title: string;
+    status: string;
+    planId: string;
+    createdAt: string;
+    updatedAt: string;
+  }> = [];
+
+  for (const entry of entries) {
+    const fp = path.join(tasksRoot, entry, 'task.yaml');
+    if (!(await fs.pathExists(fp))) continue;
+    try {
+      const raw = await fs.readJson(fp);
+      if (!status || raw.status === status) {
+        tasks.push({
+          id: raw.id,
+          title: raw.title,
+          status: raw.status,
+          planId: raw.planId,
+          createdAt: raw.createdAt,
+          updatedAt: raw.updatedAt,
+        });
+      }
+    } catch {
+      // Skip malformed task files
+    }
+  }
+
+  tasks.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return { content: [{ type: 'text' as const, text: JSON.stringify({ tasks }, null, 2) }] };
+}
+
+async function handleGetTask(taskId: string) {
+  if (!taskId) return errorResult('taskId is required');
+
+  const safeId = path.basename(taskId);
+  const tasksRoot = path.join(workspacePath, 'tasks');
+  if (!(await fs.pathExists(tasksRoot))) {
+    return errorResult('tasks/ directory not found');
+  }
+
+  const entries = await fs.readdir(tasksRoot);
+  // Find by exact match or prefix match
+  const taskDir = entries.find((e) => e === safeId || e.startsWith(safeId));
+  if (!taskDir) {
+    return errorResult(`Task not found: ${safeId}. Use aethra_list_tasks to see available tasks.`);
+  }
+
+  const fp = path.join(tasksRoot, taskDir, 'task.yaml');
+  if (!(await fs.pathExists(fp))) {
+    return errorResult(`Task file not found for: ${taskDir}`);
+  }
+
+  const task = await fs.readJson(fp);
+  return { content: [{ type: 'text' as const, text: JSON.stringify(task, null, 2) }] };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

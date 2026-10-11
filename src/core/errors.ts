@@ -67,6 +67,27 @@ export class PermissionError extends AethraError {
   }
 }
 
+export class VisualFeedbackError extends AethraError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(message, 'VISUAL_FEEDBACK_ERROR', 1, details);
+    this.name = 'VisualFeedbackError';
+  }
+}
+
+export class DesignError extends AethraError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(message, 'DESIGN_ERROR', 1, details);
+    this.name = 'DesignError';
+  }
+}
+
+export class AgentError extends AethraError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(message, 'AGENT_ERROR', 1, details);
+    this.name = 'AgentError';
+  }
+}
+
 export function isAethraError(err: unknown): err is AethraError {
   return err instanceof AethraError;
 }

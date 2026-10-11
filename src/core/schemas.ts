@@ -91,6 +91,12 @@ export const ClientConfigSchema = z.object({
       { name: 'mobile', width: 375, height: 812 },
     ]),
   }).default({}),
+  visualFeedback: z.object({
+    enabled: z.boolean().default(false),
+    defaultProvider: z.string().default('manual'),
+    watchIntervalMs: z.number().default(10000),
+    autoImport: z.boolean().default(false),
+  }).default({}),
   skills: z.array(z.string()).default([]),
   enabledIntegrations: z.array(z.string()).default([]),
 });
@@ -111,6 +117,7 @@ export const EvidenceTypeSchema = z.enum([
   'forms',
   'browser-test',
   'manual',
+  'visual-feedback',
 ]);
 export type EvidenceType = z.infer<typeof EvidenceTypeSchema>;
 
@@ -264,6 +271,13 @@ export const AcceptanceCriterionSchema = z.object({
 });
 export type AcceptanceCriterion = z.infer<typeof AcceptanceCriterionSchema>;
 
+export const PlanSnapshotSchema = z.object({
+  gitCommit: z.string().optional(),
+  gitBranch: z.string().optional(),
+  auditId: z.string().optional(),
+});
+export type PlanSnapshot = z.infer<typeof PlanSnapshotSchema>;
+
 export const ImplementationPlanSchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -290,6 +304,8 @@ export const ImplementationPlanSchema = z.object({
   gitBranch: z.string().optional(),
   approvedBy: z.string().optional(),
   approvedAt: IsoTimestampSchema.optional(),
+  planSnapshot: PlanSnapshotSchema.optional(),
+  feedbackIds: z.array(z.string()).default([]),
 });
 export type ImplementationPlan = z.infer<typeof ImplementationPlanSchema>;
 
@@ -322,6 +338,7 @@ export const TaskRecordSchema = z.object({
   gitBranch: z.string().optional(),
   verificationId: z.string().optional(),
   notes: z.string().optional(),
+  feedbackIds: z.array(z.string()).default([]),
 });
 export type TaskRecord = z.infer<typeof TaskRecordSchema>;
 
