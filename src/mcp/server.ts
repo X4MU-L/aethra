@@ -37,6 +37,7 @@ import {
   dbListFeedback,
   dbLoadFeedback,
   dbListPlans,
+  dbGetSessionsForClient,
 } from "../engine/db.js";
 
 // ─── Server setup ─────────────────────────────────────────────────────────────
@@ -851,28 +852,41 @@ async function handleGetFeedback(feedbackId: string) {
 
 const AGENTATION_PORT = 4747;
 const AGENTATION_BASE = `http://localhost:${AGENTATION_PORT}`;
-let agentationStarted = false;
 
+/**
+ * Ensure the Agentation HTTP server is running.
+ * Delegates to the AgentationProvider to maintain a single lifecycle owner.
+ */
 async function ensureAgentationServer(): Promise<boolean> {
-  if (agentationStarted) return true;
-
   // Check if already running
   try {
     const res = await fetch(`${AGENTATION_BASE}/health`, {
       signal: AbortSignal.timeout(2000),
     });
-    if (res.ok) {
-      agentationStarted = true;
+    if (res.ok) return true;
+  } catch {
+    // Not running
+  }
+
+  // Start via the provider (single lifecycle owner)
+  try {
+    const { getProvider } =
+      await import("../visual-feedback/providers/registry.js");
+    const provider = getProvider("agentation");
+    if (provider && "startServer" in provider) {
+      await (
+        provider as { startServer: (port?: number) => Promise<void> }
+      ).startServer(AGENTATION_PORT);
       return true;
     }
   } catch {
-    // Not running, try to start
+    // Fall through
   }
 
+  // Direct fallback if provider not available
   try {
     const { startHttpServer } = await import("agentation-mcp");
     startHttpServer(AGENTATION_PORT);
-    agentationStarted = true;
     process.stderr.write(
       `Agentation server started on port ${AGENTATION_PORT}\n`,
     );
@@ -885,6 +899,58 @@ async function ensureAgentationServer(): Promise<boolean> {
   }
 }
 
+/** Get the client slug for this workspace and its mapped Agentation sessions. */
+function getWorkspaceSessionScope(): {
+  clientSlug: string;
+  mappedSessions: string[];
+} {
+  let clientSlug = "unknown";
+  try {
+    const configPath = path.join(workspacePath, "client.yaml");
+    const raw = fs.readFileSync(configPath, "utf8");
+    const config = yaml.load(raw) as ClientConfig;
+    clientSlug = config.slug;
+  } catch {
+    // Fall through with unknown
+  }
+
+  const db = getDb(workspacePath);
+  const mappedSessions = dbGetSessionsForClient(db, clientSlug);
+  return { clientSlug, mappedSessions };
+}
+
+/** Fetch pending annotations only from sessions mapped to this workspace. */
+async function fetchScopedPendingAnnotations(): Promise<unknown[]> {
+  const { mappedSessions } = getWorkspaceSessionScope();
+
+  if (mappedSessions.length === 0) {
+    return [];
+  }
+
+  const allPending: unknown[] = [];
+  for (const sessionId of mappedSessions) {
+    try {
+      const res = await fetch(
+        `${AGENTATION_BASE}/sessions/${sessionId}/pending`,
+        { signal: AbortSignal.timeout(5000) },
+      );
+      if (!res.ok) continue;
+      const annotations = await res.json();
+      if (Array.isArray(annotations)) {
+        allPending.push(
+          ...annotations.map((a: Record<string, unknown>) => ({
+            ...a,
+            sessionId,
+          })),
+        );
+      }
+    } catch {
+      // Skip failing sessions
+    }
+  }
+  return allPending;
+}
+
 async function handleGetPendingAnnotations() {
   if (!(await ensureAgentationServer())) {
     return errorResult(
@@ -892,39 +958,28 @@ async function handleGetPendingAnnotations() {
     );
   }
 
+  const { mappedSessions } = getWorkspaceSessionScope();
+  if (mappedSessions.length === 0) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              annotations: [],
+              count: 0,
+              note: "No sessions mapped to this workspace. Use 'aethra feedback watch' to create a session.",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
   try {
-    const sessionsRes = await fetch(`${AGENTATION_BASE}/sessions`, {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!sessionsRes.ok) {
-      return errorResult(`Failed to list sessions: ${sessionsRes.status}`);
-    }
-
-    const sessions = (await sessionsRes.json()) as Array<{ id: string }>;
-    const allPending: unknown[] = [];
-
-    for (const session of sessions) {
-      try {
-        const res = await fetch(
-          `${AGENTATION_BASE}/sessions/${session.id}/pending`,
-          { signal: AbortSignal.timeout(5000) },
-        );
-        if (res.ok) {
-          const annotations = await res.json();
-          if (Array.isArray(annotations)) {
-            allPending.push(
-              ...annotations.map((a: Record<string, unknown>) => ({
-                ...a,
-                sessionId: session.id,
-              })),
-            );
-          }
-        }
-      } catch {
-        // Skip failing sessions
-      }
-    }
-
+    const allPending = await fetchScopedPendingAnnotations();
     return {
       content: [
         {
@@ -949,26 +1004,39 @@ async function handleWatchAnnotations(timeoutSeconds?: number) {
     return errorResult("Agentation server not available.");
   }
 
+  const { mappedSessions } = getWorkspaceSessionScope();
+  if (mappedSessions.length === 0) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              annotations: [],
+              count: 0,
+              waitedSeconds: 0,
+              note: "No sessions mapped to this workspace.",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
   const timeout = Math.min(Math.max(timeoutSeconds ?? 10, 1), 60);
 
   try {
-    // Poll for new annotations over the timeout window
     const startTime = Date.now();
     const collected: unknown[] = [];
     const seenIds = new Set<string>();
 
     while (Date.now() - startTime < timeout * 1000) {
-      const sessionsRes = await fetch(`${AGENTATION_BASE}/sessions`, {
-        signal: AbortSignal.timeout(3000),
-      });
-      if (!sessionsRes.ok) break;
-
-      const sessions = (await sessionsRes.json()) as Array<{ id: string }>;
-
-      for (const session of sessions) {
+      for (const sessionId of mappedSessions) {
         try {
           const res = await fetch(
-            `${AGENTATION_BASE}/sessions/${session.id}/pending`,
+            `${AGENTATION_BASE}/sessions/${sessionId}/pending`,
             { signal: AbortSignal.timeout(3000) },
           );
           if (!res.ok) continue;
@@ -979,7 +1047,7 @@ async function handleWatchAnnotations(timeoutSeconds?: number) {
             const id = String(ann.id ?? "");
             if (id && !seenIds.has(id)) {
               seenIds.add(id);
-              collected.push({ ...ann, sessionId: session.id });
+              collected.push({ ...ann, sessionId });
             }
           }
         } catch {
@@ -987,8 +1055,8 @@ async function handleWatchAnnotations(timeoutSeconds?: number) {
         }
       }
 
-      if (collected.length > 0) break; // Got something, return immediately
-      await new Promise((r) => setTimeout(r, 2000)); // Poll every 2s
+      if (collected.length > 0) break;
+      await new Promise((r) => setTimeout(r, 2000));
     }
 
     return {
@@ -1170,48 +1238,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     }
 
     try {
-      const sessionsRes = await fetch(`${AGENTATION_BASE}/sessions`, {
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!sessionsRes.ok) {
-        return {
-          contents: [
-            {
-              uri,
-              mimeType: "application/json",
-              text: JSON.stringify({ annotations: [] }),
-            },
-          ],
-        };
-      }
-
-      const sessions = (await sessionsRes.json()) as Array<{ id: string }>;
-      const allPending: unknown[] = [];
-
-      for (const session of sessions) {
-        try {
-          const res = await fetch(
-            `${AGENTATION_BASE}/sessions/${session.id}/pending`,
-            {
-              signal: AbortSignal.timeout(5000),
-            },
-          );
-          if (res.ok) {
-            const annotations = await res.json();
-            if (Array.isArray(annotations)) {
-              allPending.push(
-                ...annotations.map((a: Record<string, unknown>) => ({
-                  ...a,
-                  sessionId: session.id,
-                })),
-              );
-            }
-          }
-        } catch {
-          /* skip */
-        }
-      }
-
+      const allPending = await fetchScopedPendingAnnotations();
       return {
         contents: [
           {

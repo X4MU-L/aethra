@@ -446,6 +446,136 @@ export function registerFeedbackCommand(program: Command): void {
 
   // -- feedback watch --------------------------------------------------------
   feedback
+    .command("setup-toolbar")
+    .description(
+      "Check toolbar compatibility and print setup instructions for the client project",
+    )
+    .option("--client <slug>", "Specify client by slug")
+    .option("--port <port>", "Agentation server port", "4747")
+    .action(async (opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+
+      try {
+        const { config } = await resolveClientWorkspace(clientSlug);
+        const port = parseInt(opts.port, 10);
+
+        console.log(
+          chalk.bold.blue(`\n  Toolbar Setup Check — ${config.name}\n`),
+        );
+
+        // Check platform compatibility
+        const platform = config.platform ?? "unknown";
+        const compatible = ["react", "nextjs"].includes(platform);
+
+        console.log(chalk.gray(`  Platform: ${platform}`));
+        console.log(
+          compatible
+            ? chalk.green("  ✓ Compatible with Agentation toolbar")
+            : chalk.yellow(
+                "  ⚠ Agentation toolbar requires React or Next.js. Use manual feedback instead.",
+              ),
+        );
+
+        if (!compatible) {
+          console.log(
+            chalk.gray(
+              "\n  For non-React projects, use:\n    aethra feedback watch --provider manual\n",
+            ),
+          );
+          return;
+        }
+
+        // Check if repository path is configured
+        const repoPath = config.repositoryPath;
+        if (!repoPath) {
+          console.log(
+            chalk.yellow("\n  ⚠ No repositoryPath configured in client.yaml."),
+          );
+          console.log(
+            chalk.gray(
+              "  Set it to enable automatic detection of your app entry point.\n",
+            ),
+          );
+        }
+
+        // Check if agentation package is already installed in the client project
+        let alreadyInstalled = false;
+        if (repoPath) {
+          const { pathExists } = await import("../../engine/fs.js");
+          const pkgPath = `${repoPath}/node_modules/agentation/package.json`;
+          alreadyInstalled = await pathExists(pkgPath);
+        }
+
+        console.log(
+          alreadyInstalled
+            ? chalk.green("  ✓ agentation package detected in client project")
+            : chalk.gray(
+                "  ○ agentation package not detected in client project",
+              ),
+        );
+
+        // Print setup instructions
+        console.log(chalk.bold("\n  Setup Instructions:\n"));
+
+        if (!alreadyInstalled) {
+          console.log(
+            chalk.cyan("  1. Install the toolbar in your project:\n"),
+          );
+          console.log(
+            chalk.gray(
+              `     cd ${repoPath ?? "<project-root>"}\n     npm install agentation -D\n`,
+            ),
+          );
+        }
+
+        console.log(
+          chalk.cyan(
+            `  ${alreadyInstalled ? "1" : "2"}. Add the toolbar to your app root (development only):\n`,
+          ),
+        );
+        console.log(
+          chalk.gray(
+            `     import { Agentation } from "agentation";\n\n     function App() {\n       return (\n         <>\n           <YourApp />\n           {process.env.NODE_ENV === "development" && (\n             <Agentation endpoint="http://localhost:${port}" />\n           )}\n         </>\n       );\n     }\n`,
+          ),
+        );
+
+        console.log(
+          chalk.cyan(
+            `  ${alreadyInstalled ? "2" : "3"}. Start the feedback server:\n`,
+          ),
+        );
+        console.log(
+          chalk.gray(
+            `     aethra feedback watch --provider agentation --client ${config.slug}\n`,
+          ),
+        );
+
+        console.log(
+          chalk.cyan(
+            `  ${alreadyInstalled ? "3" : "4"}. Open your app and click elements to annotate.\n`,
+          ),
+        );
+
+        console.log(chalk.bold("  Important:\n"));
+        console.log(
+          chalk.gray(
+            "  • The toolbar only appears in development (NODE_ENV=development)",
+          ),
+        );
+        console.log(chalk.gray("  • Never deploy the toolbar to production"));
+        console.log(
+          chalk.gray(
+            `  • The server runs on localhost:${port} (loopback only)\n`,
+          ),
+        );
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`setup-toolbar failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  feedback
     .command("watch")
     .description("Poll for new feedback at regular intervals")
     .option("--provider <name>", "Provider to watch")
