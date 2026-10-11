@@ -1,0 +1,47 @@
+node_modules/
+dist/
+.env
+.env.local
+*.local
+
+# Client workspaces (stored outside repo or gitignored locally)
+clients/
+.local/
+
+# Auth state - NEVER commit
+**/auth-state/
+**/.auth/
+**/cookies.json
+**/storage-state.json
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+
+# Build artifacts
+*.js.map
+*.d.ts.map
+coverage/
+.nyc_output/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# Temp
+tmp/
+temp/
+.tmp/
