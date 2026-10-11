@@ -5,7 +5,7 @@
 
 import path from "path";
 import { commandExists } from "../engine/subprocess.js";
-import { writeFile, ensureDir } from "../engine/fs.js";
+import { writeFile, ensureDir, readFile, pathExists } from "../engine/fs.js";
 import { logger } from "../core/logger.js";
 import type { AgentAdapter, AgentContext, AgentResult } from "./adapter.js";
 
@@ -82,9 +82,37 @@ export class ClaudeCodeAdapter implements AgentAdapter {
       for (const skill of ctx.skills) {
         sections.push(
           `- **${skill.name}**: ${skill.description} _(${skill.reason})_`,
+          `  - File: \`${skill.filePath}\``,
         );
       }
       sections.push("");
+
+      // Embed skill instruction bodies within a bounded context budget (max 4000 chars per skill)
+      for (const skill of ctx.skills) {
+        if (skill.filePath && (await pathExists(skill.filePath))) {
+          try {
+            const raw = await readFile(skill.filePath);
+            const body = raw.replace(/^---[\s\S]*?---\s*/, "").trim();
+            const boundedBody =
+              body.length > 4000
+                ? body.slice(0, 4000) +
+                  "\n\n...(content truncated for context budget; full instructions at file path above)"
+                : body;
+
+            sections.push(
+              `### Skill: ${skill.name}`,
+              "",
+              `> Why selected: ${skill.reason}`,
+              `> Source: \`${skill.filePath}\``,
+              "",
+              boundedBody,
+              "",
+            );
+          } catch {
+            // Path already provided above
+          }
+        }
+      }
     }
 
     if (ctx.evidencePaths.length > 0) {

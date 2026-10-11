@@ -87,6 +87,26 @@ export async function writeClientFacts(
   logger.success('Client facts written to workspace');
 }
 
+/** Load client facts from workspace parsed-facts.json (or fallback). */
+export async function loadClientFacts(
+  workspacePath: string,
+): Promise<Partial<ClientFacts> | null> {
+  const candidatePaths = [
+    path.join(workspacePath, 'client-facts', 'parsed-facts.json'),
+    path.join(workspacePath, 'client-facts.json'),
+  ];
+  for (const p of candidatePaths) {
+    if (await pathExists(p)) {
+      try {
+        return await readJson<Partial<ClientFacts>>(p);
+      } catch {
+        // Continue to fallback
+      }
+    }
+  }
+  return null;
+}
+
 /** Generate the README.md for a client workspace. */
 export function generateReadme(facts: Partial<ClientFacts>, config: ClientConfig): string {
   const name = facts.name ?? 'Unknown Client';

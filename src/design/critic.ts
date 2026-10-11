@@ -141,13 +141,26 @@ export async function loadCritique(
   if (!(await pathExists(dir))) return null;
 
   const files = await glob("critique-*.json", { cwd: dir });
+  const matches: CritiqueResult[] = [];
+
   for (const file of files) {
     try {
       const critique = await readJson<CritiqueResult>(path.join(dir, file));
-      if (critique.taskId === taskId) return critique;
+      if (critique.taskId === taskId) {
+        matches.push(critique);
+      }
     } catch {
       // Skip malformed files
     }
   }
-  return null;
+
+  if (matches.length === 0) return null;
+
+  // Sort newest first by createdAt
+  matches.sort(
+    (a, b) =>
+      new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+  );
+
+  return matches[0]!;
 }

@@ -45,7 +45,12 @@ export abstract class VisualFeedbackProvider {
     pageUrl: string;
     clientSlug: string;
     sessionId: string;
-  }): Promise<{ success: boolean; sessionUrl?: string; error?: string }>;
+  }): Promise<{
+    success: boolean;
+    sessionUrl?: string;
+    sessionId?: string;
+    error?: string;
+  }>;
 
   /** Retrieve pending annotations from the provider. */
   abstract retrievePending(clientSlug: string): Promise<RawAnnotation[]>;

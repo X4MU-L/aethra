@@ -10,7 +10,9 @@
 
 import Database from "better-sqlite3";
 import path from "path";
+import fs from "fs-extra";
 import { logger } from "../core/logger.js";
+import { VisualFeedbackError } from "../core/errors.js";
 import type {
   TaskRecord,
   Finding,
@@ -31,7 +33,9 @@ export function getDb(workspacePath: string): Database.Database {
   const cached = dbCache.get(workspacePath);
   if (cached) return cached;
 
-  const dbPath = path.join(workspacePath, ".local", "aethra.db");
+  const localDir = path.join(workspacePath, ".local");
+  fs.ensureDirSync(localDir);
+  const dbPath = path.join(localDir, "aethra.db");
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
@@ -223,6 +227,20 @@ const MIGRATIONS: Array<{ version: number; description: string; sql: string }> =
       ON session_mappings(client_slug);
   `,
     },
+    {
+      version: 3,
+      description: "Enforce unique session ownership across client workspaces",
+      sql: `
+    DELETE FROM session_mappings
+    WHERE rowid NOT IN (
+      SELECT MAX(rowid) FROM session_mappings
+      GROUP BY agentation_session_id
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_session_mappings_unique_session
+      ON session_mappings(agentation_session_id);
+  `,
+    },
   ];
 
 function runMigrations(db: Database.Database): void {
@@ -374,10 +392,10 @@ function rowToFeedback(row: FeedbackRow): VisualFeedback {
     viewport:
       row.viewport_width != null && row.viewport_height != null
         ? {
-            width: row.viewport_width,
-            height: row.viewport_height,
-            deviceScaleFactor: row.viewport_scale ?? undefined,
-          }
+          width: row.viewport_width,
+          height: row.viewport_height,
+          deviceScaleFactor: row.viewport_scale ?? undefined,
+        }
         : undefined,
     comment: row.comment,
     kind: row.kind as VisualFeedback["kind"],
@@ -572,44 +590,61 @@ export function dbSaveFeedback(
   feedback: VisualFeedback,
 ): void {
   const row = feedbackToRow(feedback);
-  db.prepare(
-    `
-    INSERT INTO feedback_items (
-      id, provider, provider_annotation_id, client_id, project_id, task_id, session_id,
-      page_url, viewport_width, viewport_height, viewport_scale,
-      comment, kind, intent, severity,
-      element_tag, element_selector, bounding_box, source_file,
-      component_tree, css_classes, computed_styles, accessibility_context,
-      nearby_text, screenshot_reference, provider_metadata,
-      created_at, status, resolution_summary,
-      related_finding_ids, related_feedback_ids)
-    VALUES (
-      @id, @provider, @provider_annotation_id, @client_id, @project_id, @task_id, @session_id,
-      @page_url, @viewport_width, @viewport_height, @viewport_scale,
-      @comment, @kind, @intent, @severity,
-      @element_tag, @element_selector, @bounding_box, @source_file,
-      @component_tree, @css_classes, @computed_styles, @accessibility_context,
-      @nearby_text, @screenshot_reference, @provider_metadata,
-      @created_at, @status, @resolution_summary,
-      @related_finding_ids, @related_feedback_ids)
-    ON CONFLICT(id) DO UPDATE SET
-      comment = excluded.comment,
-      kind = excluded.kind,
-      intent = excluded.intent,
-      severity = excluded.severity,
-      element_tag = excluded.element_tag,
-      element_selector = excluded.element_selector,
-      bounding_box = excluded.bounding_box,
-      source_file = excluded.source_file,
-      component_tree = excluded.component_tree,
-      css_classes = excluded.css_classes,
-      computed_styles = excluded.computed_styles,
-      accessibility_context = excluded.accessibility_context,
-      nearby_text = excluded.nearby_text,
-      page_url = excluded.page_url,
-      provider_metadata = excluded.provider_metadata
-  `,
-  ).run(row);
+  db.transaction(() => {
+    // If an item already exists with the same (provider, provider_annotation_id, client_id),
+    // ensure we reuse its existing primary key ID so ON CONFLICT(id) triggers smoothly
+    if (feedback.providerAnnotationId) {
+      const existing = dbFindFeedbackByProviderAnnotation(
+        db,
+        feedback.provider,
+        feedback.providerAnnotationId,
+        feedback.clientId,
+      );
+      if (existing) {
+        row.id = existing.id;
+        feedback.id = existing.id;
+      }
+    }
+
+    db.prepare(
+      `
+      INSERT INTO feedback_items (
+        id, provider, provider_annotation_id, client_id, project_id, task_id, session_id,
+        page_url, viewport_width, viewport_height, viewport_scale,
+        comment, kind, intent, severity,
+        element_tag, element_selector, bounding_box, source_file,
+        component_tree, css_classes, computed_styles, accessibility_context,
+        nearby_text, screenshot_reference, provider_metadata,
+        created_at, status, resolution_summary,
+        related_finding_ids, related_feedback_ids)
+      VALUES (
+        @id, @provider, @provider_annotation_id, @client_id, @project_id, @task_id, @session_id,
+        @page_url, @viewport_width, @viewport_height, @viewport_scale,
+        @comment, @kind, @intent, @severity,
+        @element_tag, @element_selector, @bounding_box, @source_file,
+        @component_tree, @css_classes, @computed_styles, @accessibility_context,
+        @nearby_text, @screenshot_reference, @provider_metadata,
+        @created_at, @status, @resolution_summary,
+        @related_finding_ids, @related_feedback_ids)
+      ON CONFLICT(id) DO UPDATE SET
+        comment = excluded.comment,
+        kind = excluded.kind,
+        intent = excluded.intent,
+        severity = excluded.severity,
+        element_tag = excluded.element_tag,
+        element_selector = excluded.element_selector,
+        bounding_box = excluded.bounding_box,
+        source_file = excluded.source_file,
+        component_tree = excluded.component_tree,
+        css_classes = excluded.css_classes,
+        computed_styles = excluded.computed_styles,
+        accessibility_context = excluded.accessibility_context,
+        nearby_text = excluded.nearby_text,
+        page_url = excluded.page_url,
+        provider_metadata = excluded.provider_metadata
+    `,
+    ).run(row);
+  })();
 }
 
 export function dbLoadFeedback(
@@ -731,6 +766,18 @@ export function dbSaveSessionMapping(
   clientSlug: string,
   workspacePath: string,
 ): void {
+  const existing = db
+    .prepare(
+      "SELECT client_slug FROM session_mappings WHERE agentation_session_id = ?",
+    )
+    .get(agentationSessionId) as { client_slug: string } | undefined;
+
+  if (existing && existing.client_slug !== clientSlug) {
+    throw new VisualFeedbackError(
+      `Agentation session "${agentationSessionId}" is already mapped to client "${existing.client_slug}" and cannot be assigned to "${clientSlug}".`,
+    );
+  }
+
   db.prepare(
     `
     INSERT OR REPLACE INTO session_mappings (agentation_session_id, client_slug, workspace_path, created_at)
@@ -742,6 +789,18 @@ export function dbSaveSessionMapping(
     workspacePath,
     new Date().toISOString(),
   );
+}
+
+export function dbGetClientForSession(
+  db: Database.Database,
+  agentationSessionId: string,
+): string | null {
+  const row = db
+    .prepare(
+      "SELECT client_slug FROM session_mappings WHERE agentation_session_id = ?",
+    )
+    .get(agentationSessionId) as { client_slug: string } | undefined;
+  return row ? row.client_slug : null;
 }
 
 export function dbGetSessionsForClient(

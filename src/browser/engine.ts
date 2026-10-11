@@ -136,7 +136,6 @@ export async function inspectPage(
 }
 
 // Type alias for Playwright Page (avoid complex generic)
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 type PlaywrightPage = any;
 
 /** Extract page metadata and structure using individual Playwright locator queries.

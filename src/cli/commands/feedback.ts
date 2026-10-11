@@ -438,6 +438,13 @@ export function registerFeedbackCommand(program: Command): void {
         console.log(`  Feedback: ${updated.id.slice(0, 8)}`);
         console.log(`  Status:   ${updated.status}`);
         console.log(`  Summary:  ${opts.summary}`);
+        if (updated.upstreamSynced === false) {
+          console.log(
+            chalk.yellow(
+              `  ⚠ Upstream sync failed: ${updated.upstreamError ?? "unknown error"}`,
+            ),
+          );
+        }
         console.log();
       } catch (err) {
         const e = toAethraError(err);
@@ -626,6 +633,7 @@ export function registerFeedbackCommand(program: Command): void {
             stopServer: () => Promise<void>;
             subscribeToEvents: (
               cb: (ann: Record<string, unknown>) => void,
+              clientSlug?: string,
             ) => Promise<void>;
           };
 
@@ -648,17 +656,49 @@ export function registerFeedbackCommand(program: Command): void {
             process.exit(1);
           }
 
+          // Resolve safe local development URL (never use production URL for Agentation)
+          const isLocal = (url?: string): boolean => {
+            if (!url) return false;
+            try {
+              const h = new URL(url).hostname.toLowerCase();
+              return (
+                h === "localhost" ||
+                h === "127.0.0.1" ||
+                h === "::1" ||
+                h.endsWith(".local") ||
+                h.endsWith(".test") ||
+                h.endsWith(".localhost")
+              );
+            } catch {
+              return false;
+            }
+          };
+
+          const pageUrl =
+            (isLocal(config.localUrl) ? config.localUrl : undefined) ??
+            (isLocal(config.primaryUrl) ? config.primaryUrl : undefined) ??
+            "http://localhost:3000";
+
           // Create a session mapping so retrievePending can find annotations
           const crypto = await import("crypto");
-          const sessionId = crypto.randomBytes(8).toString("hex");
-          const pageUrl =
-            config.primaryUrl ?? config.localUrl ?? "http://localhost:3000";
-          await provider.startSession({
+          const proposedSessionId = crypto.randomBytes(8).toString("hex");
+
+          const sessionResult = await provider.startSession({
             pageUrl,
             clientSlug: slug,
-            sessionId,
+            sessionId: proposedSessionId,
           });
-          console.log(chalk.gray(`  Session: ${sessionId} → ${pageUrl}`));
+
+          if (!sessionResult.success) {
+            logger.error(
+              `Failed to create Agentation session: ${sessionResult.error ?? "unknown error"}`,
+            );
+            await agProvider.stopServer().catch(() => {});
+            process.exit(1);
+          }
+
+          const activeSessionId = sessionResult.sessionId ?? proposedSessionId;
+          console.log(chalk.gray(`  Session: ${activeSessionId} → ${pageUrl}`));
 
           const spinner = ora({
             text: "Listening for annotations (real-time + polling fallback)...",
@@ -681,7 +721,7 @@ export function registerFeedbackCommand(program: Command): void {
           process.on("SIGINT", shutdown);
           process.on("SIGTERM", shutdown);
 
-          // Subscribe to SSE events for real-time annotations
+          // Subscribe to SSE events for real-time annotations with workspace isolation
           await agProvider.subscribeToEvents((rawAnnotation) => {
             try {
               const feedback = provider.normalize(
@@ -707,7 +747,7 @@ export function registerFeedbackCommand(program: Command): void {
             } catch (err) {
               logger.warn(`SSE annotation error: ${(err as Error).message}`);
             }
-          });
+          }, slug);
 
           // Slower polling loop as safety net
           const fallbackIntervalMs = Math.max(intervalMs, 30000);
@@ -823,6 +863,70 @@ export function registerFeedbackCommand(program: Command): void {
       } catch (err) {
         const e = toAethraError(err);
         logger.error(`feedback watch failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  // -- feedback add ----------------------------------------------------------
+  feedback
+    .command("add")
+    .description("Add a visual feedback item directly to the active workspace")
+    .requiredOption("--comment <text>", "Feedback comment / description")
+    .option("--page <url>", "Page URL where feedback was observed")
+    .option(
+      "--kind <kind>",
+      "Kind (bug, style, accessibility, content, enhancement, question, other)",
+      "other",
+    )
+    .option(
+      "--severity <sev>",
+      "Severity (critical, high, medium, low)",
+      "medium",
+    )
+    .option("--selector <sel>", "CSS selector of element")
+    .option("--client <slug>", "Specify client by slug")
+    .action(async (opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+
+      try {
+        const { config, workspacePath, slug } =
+          await resolveClientWorkspace(clientSlug);
+        const crypto = await import("crypto");
+        const pageUrl =
+          opts.page ??
+          config.localUrl ??
+          config.primaryUrl ??
+          "http://localhost:3000";
+        const feedbackId = crypto.randomBytes(8).toString("hex");
+
+        const item = {
+          id: feedbackId,
+          provider: "manual",
+          clientId: slug,
+          pageUrl,
+          comment: opts.comment,
+          kind: opts.kind,
+          intent: "investigate",
+          severity: opts.severity,
+          elementSelector: opts.selector,
+          createdAt: new Date().toISOString(),
+          status: "pending",
+        };
+
+        await saveFeedback(workspacePath, item as any);
+
+        console.log(
+          chalk.bold.green(`\n  \u2713 Manual feedback added — ${config.name}\n`),
+        );
+        console.log(`  ID:       ${feedbackId}`);
+        console.log(`  Page:     ${pageUrl}`);
+        console.log(`  Comment:  ${opts.comment}`);
+        console.log(`  Kind:     ${opts.kind}`);
+        console.log(`  Severity: ${opts.severity}`);
+        console.log();
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`feedback add failed: ${e.message}`);
         process.exit(e.exitCode);
       }
     });

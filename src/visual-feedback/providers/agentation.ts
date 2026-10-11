@@ -32,7 +32,10 @@ import {
   getDb,
   dbGetSessionsForClient,
   dbSaveSessionMapping,
+  dbIsSessionMapped,
 } from "../../engine/db.js";
+
+// ─── Upstream annotation schema (Agentation API) ────────────────────────────
 
 // ─── Upstream annotation schema (Agentation API) ────────────────────────────
 
@@ -41,48 +44,164 @@ const AgentationAnnotationSchema = z.object({
   comment: z.string(),
   elementPath: z.string(),
   timestamp: z.union([z.number(), z.string()]),
-  x: z.number(),
-  y: z.number(),
+  x: z.number().optional().default(0),
+  y: z.number().optional().default(0),
   element: z.string(),
   // Optional fields
-  url: z.string().url().optional(),
+  url: z.string().optional(),
   severity: z.string().optional(),
   kind: z.string().optional(),
   intent: z.string().optional(),
   boundingBox: BoundingBoxSchema.optional(),
-  reactComponents: z.array(z.string()).optional(),
-  cssClasses: z.array(z.string()).optional(),
+  reactComponents: z.union([z.string(), z.array(z.string())]).optional(),
+  cssClasses: z.union([z.string(), z.array(z.string())]).optional(),
   sourceFile: z.string().optional(),
   attributes: z.record(z.unknown()).optional(),
-  computedStyles: z.record(z.string()).optional(),
-  accessibility: z
-    .object({
-      role: z.string().optional(),
-      ariaLabel: z.string().optional(),
-      contrast: z.number().optional(),
-      violations: z.array(z.string()).optional(),
-    })
-    .optional(),
+  computedStyles: z.union([z.string(), z.record(z.unknown())]).optional(),
+  accessibility: z.union([z.string(), z.record(z.unknown())]).optional(),
   nearbyText: z.string().optional(),
   selectedText: z.string().optional(),
   // Structured design input
   placement: z
     .object({
+      componentType: z.string().optional(),
       component: z.string().optional(),
       width: z.number().optional(),
       height: z.number().optional(),
+      scrollY: z.number().optional(),
       position: z.string().optional(),
+      text: z.string().optional(),
     })
     .optional(),
   rearrange: z
     .object({
+      selector: z.string().optional(),
+      label: z.string().optional(),
+      tagName: z.string().optional(),
+      originalRect: BoundingBoxSchema.optional(),
+      currentRect: BoundingBoxSchema.optional(),
       originalBounds: BoundingBoxSchema.optional(),
       currentBounds: BoundingBoxSchema.optional(),
     })
     .optional(),
-  // Internal — injected by retrievePending
+  // Internal — injected by retrievePending or SSE
   _sessionId: z.string().optional(),
 });
+
+function normalizeCssClasses(val: string | string[] | undefined): string[] | undefined {
+  if (!val) return undefined;
+  if (Array.isArray(val)) {
+    const cleaned = val.map((s) => String(s).trim()).filter(Boolean);
+    return cleaned.length > 0 ? cleaned : undefined;
+  }
+  if (typeof val === "string") {
+    const split = val.split(/\s+/).map((s) => s.trim()).filter(Boolean);
+    return split.length > 0 ? split : undefined;
+  }
+  return undefined;
+}
+
+function normalizeReactComponents(val: string | string[] | undefined): string[] | undefined {
+  if (!val) return undefined;
+  if (Array.isArray(val)) {
+    const cleaned = val.map((s) => String(s).trim()).filter(Boolean);
+    return cleaned.length > 0 ? cleaned : undefined;
+  }
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          const cleaned = parsed.map((s) => String(s).trim()).filter(Boolean);
+          return cleaned.length > 0 ? cleaned : undefined;
+        }
+      } catch {
+        // Fall through
+      }
+    }
+    const split = trimmed.split(/\s*(?:>|,)\s*/).filter(Boolean);
+    return split.length > 0 ? split : [trimmed];
+  }
+  return undefined;
+}
+
+function normalizeComputedStyles(
+  val: string | Record<string, unknown> | undefined,
+): Record<string, string> | undefined {
+  if (!val) return undefined;
+  if (typeof val === "object" && !Array.isArray(val)) {
+    const res: Record<string, string> = {};
+    for (const [k, v] of Object.entries(val)) {
+      if (typeof v === "string") res[k] = v;
+      else if (v != null) res[k] = String(v);
+    }
+    return Object.keys(res).length > 0 ? res : undefined;
+  }
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          const res: Record<string, string> = {};
+          for (const [k, v] of Object.entries(parsed)) {
+            if (v != null) res[k] = String(v);
+          }
+          return Object.keys(res).length > 0 ? res : undefined;
+        }
+      } catch {
+        // Fall through
+      }
+    }
+    // Parse CSS declarations like "color: red; font-size: 14px;"
+    const res: Record<string, string> = {};
+    const rules = trimmed.split(";").map((r) => r.trim()).filter(Boolean);
+    for (const rule of rules) {
+      const idx = rule.indexOf(":");
+      if (idx > 0) {
+        const prop = rule.slice(0, idx).trim();
+        const value = rule.slice(idx + 1).trim();
+        if (prop && value) res[prop] = value;
+      }
+    }
+    return Object.keys(res).length > 0 ? res : undefined;
+  }
+  return undefined;
+}
+
+function normalizeAccessibility(
+  val: unknown,
+): { role?: string; ariaLabel?: string; contrast?: number; violations?: string[] } | undefined {
+  if (!val) return undefined;
+  if (typeof val === "object" && val !== null && !Array.isArray(val)) {
+    const obj = val as Record<string, unknown>;
+    const res: { role?: string; ariaLabel?: string; contrast?: number; violations?: string[] } = {};
+    if (typeof obj.role === "string" && obj.role.trim()) res.role = obj.role.trim();
+    if (typeof obj.ariaLabel === "string" && obj.ariaLabel.trim()) res.ariaLabel = obj.ariaLabel.trim();
+    if (typeof obj.contrast === "number" && !isNaN(obj.contrast)) res.contrast = obj.contrast;
+    if (Array.isArray(obj.violations)) {
+      const v = obj.violations.map(String).filter(Boolean);
+      if (v.length > 0) res.violations = v;
+    }
+    return Object.keys(res).length > 0 ? res : undefined;
+  }
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (typeof parsed === "object" && parsed !== null) {
+          return normalizeAccessibility(parsed);
+        }
+      } catch {
+        // Fall through
+      }
+    }
+    return trimmed ? { ariaLabel: trimmed } : undefined;
+  }
+  return undefined;
+}
 
 // ─── Enum mappings ───────────────────────────────────────────────────────────
 
@@ -189,7 +308,12 @@ export class AgentationProvider extends VisualFeedbackProvider {
     pageUrl: string;
     clientSlug: string;
     sessionId: string;
-  }): Promise<{ success: boolean; sessionUrl?: string; error?: string }> {
+  }): Promise<{
+    success: boolean;
+    sessionUrl?: string;
+    sessionId?: string;
+    error?: string;
+  }> {
     if (!this.isLocalUrl(opts.pageUrl)) {
       return {
         success: false,
@@ -217,17 +341,30 @@ export class AgentationProvider extends VisualFeedbackProvider {
         };
       }
 
-      const session = (await res.json()) as { id: string };
-      const agentationSessionId = session.id ?? opts.sessionId;
+      const session = (await res.json()) as { id?: string };
+      const agentationSessionId = session.id;
+      if (!agentationSessionId) {
+        return {
+          success: false,
+          error: "Agentation server returned empty session ID",
+        };
+      }
 
       // Map the session to this client workspace
       if (this.workspacePath) {
-        dbSaveSessionMapping(
-          getDb(this.workspacePath),
-          agentationSessionId,
-          opts.clientSlug,
-          this.workspacePath,
-        );
+        try {
+          dbSaveSessionMapping(
+            getDb(this.workspacePath),
+            agentationSessionId,
+            opts.clientSlug,
+            this.workspacePath,
+          );
+        } catch (mapErr) {
+          return {
+            success: false,
+            error: `Session mapping failed: ${(mapErr as Error).message}`,
+          };
+        }
       }
 
       logger.info(
@@ -236,6 +373,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
       return {
         success: true,
         sessionUrl: opts.pageUrl,
+        sessionId: agentationSessionId,
       };
     } catch (err) {
       return {
@@ -245,13 +383,21 @@ export class AgentationProvider extends VisualFeedbackProvider {
     }
   }
 
-  async retrievePending(clientSlug: string): Promise<RawAnnotation[]> {
-    // Enforce session isolation: only fetch from sessions mapped to this client
+  /**
+   * Detailed retrieval distinguishing empty queue from session failures.
+   */
+  async retrievePendingDetailed(clientSlug: string): Promise<{
+    items: RawAnnotation[];
+    errors: Array<{ sessionId: string; error: string }>;
+  }> {
     if (!this.workspacePath) {
       logger.warn(
         "Agentation: no workspace context set — cannot filter by client. Call setContext() first.",
       );
-      return [];
+      return {
+        items: [],
+        errors: [{ sessionId: "*", error: "No workspace context set" }],
+      };
     }
 
     const db = getDb(this.workspacePath);
@@ -261,39 +407,56 @@ export class AgentationProvider extends VisualFeedbackProvider {
       logger.debug(
         `Agentation: no sessions mapped to client "${clientSlug}". Use 'aethra feedback watch' to create a session.`,
       );
-      return [];
+      return { items: [], errors: [] };
     }
 
-    try {
-      const allPending: RawAnnotation[] = [];
+    const items: RawAnnotation[] = [];
+    const errors: Array<{ sessionId: string; error: string }> = [];
 
-      for (const sessionId of mappedSessionIds) {
-        try {
-          const pendingRes = await fetch(
-            `${this.baseUrl}/sessions/${sessionId}/pending`,
-            { signal: AbortSignal.timeout(5000) },
-          );
-          if (!pendingRes.ok) continue;
-
-          const annotations = (await pendingRes.json()) as RawAnnotation[];
-          for (const ann of annotations) {
-            allPending.push({ ...ann, _sessionId: sessionId });
-          }
-        } catch {
-          // Skip sessions that fail
+    for (const sessionId of mappedSessionIds) {
+      try {
+        const pendingRes = await fetch(
+          `${this.baseUrl}/sessions/${sessionId}/pending`,
+          { signal: AbortSignal.timeout(5000) },
+        );
+        if (!pendingRes.ok) {
+          errors.push({
+            sessionId,
+            error: `Agentation server responded with HTTP ${pendingRes.status}`,
+          });
+          continue;
         }
-      }
 
-      logger.info(
-        `Agentation: retrieved ${allPending.length} pending annotations from ${mappedSessionIds.length} mapped session(s) for client "${clientSlug}"`,
-      );
-      return allPending;
-    } catch (err) {
-      logger.warn(
-        `Agentation: retrievePending failed: ${(err as Error).message}`,
-      );
-      return [];
+        const data = (await pendingRes.json()) as
+          | RawAnnotation[]
+          | { count?: number; annotations?: RawAnnotation[] };
+
+        const annotations = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.annotations)
+            ? data.annotations
+            : [];
+
+        for (const ann of annotations) {
+          items.push({ ...ann, _sessionId: sessionId });
+        }
+      } catch (err) {
+        errors.push({
+          sessionId,
+          error: (err as Error).message,
+        });
+      }
     }
+
+    logger.info(
+      `Agentation: retrieved ${items.length} pending annotations from ${mappedSessionIds.length} mapped session(s) for client "${clientSlug}" (${errors.length} session error(s))`,
+    );
+    return { items, errors };
+  }
+
+  async retrievePending(clientSlug: string): Promise<RawAnnotation[]> {
+    const result = await this.retrievePendingDetailed(clientSlug);
+    return result.items;
   }
 
   normalize(raw: RawAnnotation, clientSlug: string): VisualFeedback {
@@ -363,12 +526,12 @@ export class AgentationProvider extends VisualFeedbackProvider {
       elementSelector: ann.elementPath,
       elementTag: ann.element,
       boundingBox: ann.boundingBox,
-      componentTree: ann.reactComponents,
-      cssClasses: ann.cssClasses,
+      componentTree: normalizeReactComponents(ann.reactComponents),
+      cssClasses: normalizeCssClasses(ann.cssClasses),
       sourceFile: ann.sourceFile,
       nearbyText: ann.nearbyText,
-      computedStyles: ann.computedStyles,
-      accessibilityContext: ann.accessibility,
+      computedStyles: normalizeComputedStyles(ann.computedStyles),
+      accessibilityContext: normalizeAccessibility(ann.accessibility),
       providerMetadata:
         Object.keys(providerMetadata).length > 0 ? providerMetadata : undefined,
       createdAt,
@@ -380,34 +543,52 @@ export class AgentationProvider extends VisualFeedbackProvider {
     annotationId: string,
     resolution?: { status: string; summary: string },
   ): Promise<void> {
-    try {
-      const body =
-        resolution?.status === "resolved"
-          ? { isFixed: true, resolution: resolution.summary }
-          : resolution?.status === "dismissed"
-            ? { dismissed: true, dismissReason: resolution.summary }
-            : { acknowledged: true };
+    const isResolved = resolution?.status === "resolved";
+    const isDismissed = resolution?.status === "dismissed";
 
-      const res = await fetch(`${this.baseUrl}/annotations/${annotationId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(5000),
-      });
+    const patchBody = isResolved
+      ? { status: "resolved", resolvedBy: "agent" }
+      : isDismissed
+        ? { status: "dismissed", resolvedBy: "agent" }
+        : { status: "acknowledged" };
 
-      if (!res.ok) {
-        logger.warn(
-          `Agentation: acknowledge HTTP ${res.status} for ${annotationId}`,
-        );
-        return;
-      }
+    const res = await fetch(`${this.baseUrl}/annotations/${annotationId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patchBody),
+      signal: AbortSignal.timeout(5000),
+    });
 
-      logger.debug(`Agentation: acknowledged ${annotationId}`);
-    } catch (err) {
-      logger.warn(
-        `Agentation: acknowledge failed for ${annotationId}: ${(err as Error).message}`,
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(
+        `Agentation acknowledge failed (HTTP ${res.status}): ${errText || res.statusText}`,
       );
     }
+
+    // If summary provided, append a thread message
+    if (resolution?.summary && (isResolved || isDismissed)) {
+      const threadContent = isResolved
+        ? `Resolved: ${resolution.summary}`
+        : `Dismissed: ${resolution.summary}`;
+
+      const threadRes = await fetch(
+        `${this.baseUrl}/annotations/${annotationId}/thread`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ role: "agent", content: threadContent }),
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      if (!threadRes.ok) {
+        logger.warn(
+          `Agentation thread update failed for ${annotationId} (HTTP ${threadRes.status})`,
+        );
+      }
+    }
+
+    logger.debug(`Agentation: acknowledged ${annotationId}`);
   }
 
   reportCapabilities(): ProviderCapabilities {
@@ -425,12 +606,25 @@ export class AgentationProvider extends VisualFeedbackProvider {
 
   async startServer(port?: number): Promise<void> {
     if (this.serverHandle) {
-      logger.warn("Agentation server already running");
+      logger.warn("Agentation server already running in this process");
       return;
     }
 
     this.port = port ?? 4747;
     this.baseUrl = `http://localhost:${this.port}`;
+
+    // Check if a server is already alive on this port
+    try {
+      const res = await fetch(`${this.baseUrl}/health`, {
+        signal: AbortSignal.timeout(1500),
+      });
+      if (res.ok) {
+        logger.info(`Agentation HTTP server already running on port ${this.port}`);
+        return;
+      }
+    } catch {
+      // Not running, proceed to start
+    }
 
     try {
       const { startHttpServer } = await import("agentation-mcp");
@@ -458,6 +652,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
 
   async subscribeToEvents(
     callback: (annotation: RawAnnotation) => void,
+    clientSlug?: string,
   ): Promise<void> {
     this.sseAbort = new AbortController();
 
@@ -467,7 +662,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
 
       while (!this.sseAbort!.signal.aborted) {
         try {
-          const res = await fetch(`${this.baseUrl}/events`, {
+          const res = await fetch(`${this.baseUrl}/events?agent=true`, {
             headers: { Accept: "text/event-stream" },
             signal: this.sseAbort!.signal,
           });
@@ -501,8 +696,31 @@ export class AgentationProvider extends VisualFeedbackProvider {
               if (line.startsWith("data: ")) {
                 try {
                   const event = JSON.parse(line.slice(6));
-                  if (event.type === "annotation.created" && event.annotation) {
-                    callback(event.annotation as RawAnnotation);
+                  if (
+                    event.type === "annotation.created" &&
+                    (event.payload || event.annotation)
+                  ) {
+                    const ann = (event.payload ?? event.annotation) as RawAnnotation;
+                    const evSessionId =
+                      event.sessionId ?? ann.sessionId ?? ann._sessionId;
+
+                    // Enforce workspace/client isolation
+                    if (clientSlug && this.workspacePath && evSessionId) {
+                      const db = getDb(this.workspacePath);
+                      if (
+                        !dbIsSessionMapped(db, String(evSessionId), clientSlug)
+                      ) {
+                        logger.debug(
+                          `Agentation SSE: ignored annotation from session ${evSessionId} (not mapped to client "${clientSlug}")`,
+                        );
+                        continue;
+                      }
+                    }
+
+                    callback({
+                      ...ann,
+                      _sessionId: evSessionId ? String(evSessionId) : undefined,
+                    });
                   }
                 } catch {
                   // Skip malformed SSE data

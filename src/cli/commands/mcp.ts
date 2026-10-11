@@ -24,15 +24,17 @@ export function registerMcpCommand(program: Command): void {
         const { config, workspacePath } = await resolveClientWorkspace(clientSlug);
 
         // Determine where aethra-mcp will be after build
-        // When installed globally: aethra-mcp is in PATH
-        // When run from project: use node with tsx or dist
-        const mcpServerPath = path.join(workspacePath, '..', '..', 'dist', 'mcp', 'server.js');
+        // Resolved from package root rather than deriving from client workspace path
+        const { fileURLToPath } = await import("node:url");
+        const thisDir = path.dirname(fileURLToPath(import.meta.url));
+        const packageRoot = path.resolve(thisDir, "..", "..", "..");
+        const mcpServerPath = path.join(packageRoot, "dist", "mcp", "server.js");
 
         const mcpConfig = {
           mcpServers: {
             aethra: {
-              command: 'node',
-              args: [mcpServerPath, workspacePath],
+              command: "node",
+              args: [mcpServerPath, "--workspace", workspacePath],
               env: {
                 AETHRA_WORKSPACE: workspacePath,
               },

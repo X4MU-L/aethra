@@ -18,6 +18,7 @@ import {
 } from "../engine/db.js";
 import { FeedbackSessionSchema } from "./schema.js";
 import type { VisualFeedback, FeedbackSession } from "./schema.js";
+import type { RawAnnotation } from "./providers/base.js";
 import type {
   Finding,
   ImplementationPlan,
@@ -84,16 +85,42 @@ export async function importFeedback(
   if (
     "setContext" in provider &&
     typeof (provider as { setContext?: (wp: string) => void }).setContext ===
-      "function"
+    "function"
   ) {
     (provider as { setContext: (wp: string) => void }).setContext(
       workspacePath,
     );
   }
 
-  const rawAnnotations = await provider.retrievePending(clientSlug);
-  const imported: VisualFeedback[] = [];
+  let rawAnnotations: RawAnnotation[] = [];
   const errors: string[] = [];
+
+  if (
+    "retrievePendingDetailed" in provider &&
+    typeof (
+      provider as {
+        retrievePendingDetailed?: (
+          slug: string,
+        ) => Promise<{ items: RawAnnotation[]; errors: Array<{ sessionId: string; error: string }> }>;
+      }
+    ).retrievePendingDetailed === "function"
+  ) {
+    const detailed = await (
+      provider as {
+        retrievePendingDetailed: (
+          slug: string,
+        ) => Promise<{ items: RawAnnotation[]; errors: Array<{ sessionId: string; error: string }> }>;
+      }
+    ).retrievePendingDetailed(clientSlug);
+    rawAnnotations = detailed.items;
+    for (const e of detailed.errors) {
+      errors.push(`Session ${e.sessionId}: ${e.error}`);
+    }
+  } else {
+    rawAnnotations = await provider.retrievePending(clientSlug);
+  }
+
+  const imported: VisualFeedback[] = [];
   const db = getDb(workspacePath);
 
   for (const raw of rawAnnotations) {
@@ -111,6 +138,9 @@ export async function importFeedback(
         if (existing) {
           // Preserve existing Aethra ID, task links, and resolution status
           feedback.id = existing.id;
+          feedback.status = existing.status;
+          feedback.taskId = existing.taskId;
+          feedback.resolutionSummary = existing.resolutionSummary;
         }
       }
 
@@ -163,7 +193,7 @@ export async function resolveFeedback(
   feedbackId: string,
   summary: string,
   providerName?: string,
-): Promise<VisualFeedback> {
+): Promise<VisualFeedback & { upstreamSynced: boolean; upstreamError?: string }> {
   const feedback = await loadFeedback(workspacePath, feedbackId);
   if (!feedback) {
     throw new VisualFeedbackError(`Feedback not found: ${feedbackId}`);
@@ -176,6 +206,9 @@ export async function resolveFeedback(
     resolutionSummary: summary,
   });
 
+  let upstreamSynced = true;
+  let upstreamError: string | undefined;
+
   // Notify provider if specified
   const resolveProvider = providerName ?? feedback.provider;
   const provider = getProvider(resolveProvider);
@@ -186,14 +219,60 @@ export async function resolveFeedback(
         summary,
       });
     } catch (err) {
+      upstreamSynced = false;
+      upstreamError = (err as Error).message;
       logger.warn(
-        `Could not acknowledge to provider: ${(err as Error).message}`,
+        `Could not acknowledge resolution to provider: ${upstreamError}`,
       );
     }
   }
 
-  logger.info(`Feedback ${feedbackId} resolved`);
-  return feedback;
+  logger.info(`Feedback ${feedbackId} resolved (upstreamSynced: ${upstreamSynced})`);
+  return { ...feedback, upstreamSynced, upstreamError };
+}
+
+/** Mark feedback as dismissed. */
+export async function dismissFeedback(
+  workspacePath: string,
+  feedbackId: string,
+  reason: string,
+  providerName?: string,
+): Promise<VisualFeedback & { upstreamSynced: boolean; upstreamError?: string }> {
+  const feedback = await loadFeedback(workspacePath, feedbackId);
+  if (!feedback) {
+    throw new VisualFeedbackError(`Feedback not found: ${feedbackId}`);
+  }
+
+  const dismissalSummary = `Dismissed: ${reason}`;
+  feedback.status = "dismissed";
+  feedback.resolutionSummary = dismissalSummary;
+  dbUpdateFeedbackLifecycle(getDb(workspacePath), feedbackId, {
+    status: "dismissed",
+    resolutionSummary: dismissalSummary,
+  });
+
+  let upstreamSynced = true;
+  let upstreamError: string | undefined;
+
+  const resolveProvider = providerName ?? feedback.provider;
+  const provider = getProvider(resolveProvider);
+  if (provider && feedback.providerAnnotationId) {
+    try {
+      await provider.acknowledge(feedback.providerAnnotationId, {
+        status: "dismissed",
+        summary: reason,
+      });
+    } catch (err) {
+      upstreamSynced = false;
+      upstreamError = (err as Error).message;
+      logger.warn(
+        `Could not acknowledge dismissal to provider: ${upstreamError}`,
+      );
+    }
+  }
+
+  logger.info(`Feedback ${feedbackId} dismissed (upstreamSynced: ${upstreamSynced})`);
+  return { ...feedback, upstreamSynced, upstreamError };
 }
 
 /** Convert feedback to a Finding for inclusion in audit/evidence. */
@@ -207,11 +286,11 @@ export function feedbackToFinding(feedback: VisualFeedback): Finding {
     status: feedback.status === "resolved" ? "resolved" : "observed",
     evidence: feedback.screenshotReference
       ? [
-          {
-            path: feedback.screenshotReference,
-            type: "visual-feedback" as const,
-          },
-        ]
+        {
+          path: feedback.screenshotReference,
+          type: "visual-feedback" as const,
+        },
+      ]
       : [],
     verificationRequired: true,
     confidence: 1.0,

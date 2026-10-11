@@ -5,21 +5,21 @@ source:
   author: wheresryan22
   license: MIT
   version: 1.0.0
-  pinned_ref: "main" # pin to commit SHA before production use
+  pinned_ref: "834db9e31d4e0cf5c2a0bf20dc8e75db347f7d98" # pinned immutable commit SHA
 
 import:
   date: "2026-10-11"
   imported_by: Aethra Workbench
   purpose: >
-    Provide specialized illustration capability for technical explainers,
-    architecture diagrams, and visual documentation within Aethra workflows.
+    Provide specialized illustration capability for mechanism-based technical explainers
+    and crafted visual documentation within Aethra workflows.
 
 attribution:
   required: true
   notice: >
-    Engineering principles in this integration are adapted from pstack by Lauren Tan (poteto),
+    Anatomy technical illustration toolkit created by Ryan (wheresryan22),
     licensed under MIT (https://github.com/wheresryan22/anatomy/blob/main/LICENSE).
-    Original source: https://github.com/wheresryan22/anatomy/tree/main
+    Original source: https://github.com/wheresryan22/anatomy
 
 classification:
   status: planned

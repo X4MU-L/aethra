@@ -4,7 +4,10 @@
  * Serves as the fallback for platforms without toolbar support.
  */
 
+import path from "path";
 import crypto from "crypto";
+import { glob } from "glob";
+import { readJson, pathExists } from "../../engine/fs.js";
 import type { PlatformType, ClientConfig } from "../../core/schemas.js";
 import { VisualFeedbackError } from "../../core/errors.js";
 import type { VisualFeedback } from "../schema.js";
@@ -18,6 +21,13 @@ import { VisualFeedbackProvider } from "./base.js";
 
 export class ManualFeedbackProvider extends VisualFeedbackProvider {
   readonly name = "manual";
+
+  private workspacePath: string | null = null;
+
+  /** Set workspace context for reading file-based manual feedback. */
+  setContext(workspacePath: string): void {
+    this.workspacePath = workspacePath;
+  }
 
   async checkAvailability(): Promise<ProviderStatus> {
     return {
@@ -47,9 +57,37 @@ export class ManualFeedbackProvider extends VisualFeedbackProvider {
   }
 
   async retrievePending(_clientSlug: string): Promise<RawAnnotation[]> {
-    // Manual provider does not poll an external source.
-    // Manual feedback is created via CLI commands and stored directly in SQLite.
-    return [];
+    // Check if feedback/items directory exists in the workspace
+    if (!this.workspacePath) return [];
+
+    const itemsDir = path.join(this.workspacePath, "feedback", "items");
+    if (!(await pathExists(itemsDir))) return [];
+
+    try {
+      const files = await glob("*.json", { cwd: itemsDir });
+      const items: RawAnnotation[] = [];
+
+      for (const file of files) {
+        try {
+          const content = await readJson<Record<string, unknown>>(
+            path.join(itemsDir, file),
+          );
+          if (content && typeof content === "object") {
+            const id = String(content["id"] ?? path.basename(file, ".json"));
+            items.push({
+              id,
+              ...content,
+            });
+          }
+        } catch {
+          // Skip invalid JSON files
+        }
+      }
+
+      return items;
+    } catch {
+      return [];
+    }
   }
 
   normalize(raw: RawAnnotation, clientSlug: string): VisualFeedback {

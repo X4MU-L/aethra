@@ -33,8 +33,8 @@ examples:
 createdAt: "2026-10-11T00:00:00.000Z"
 updatedAt: "2026-10-11T00:00:00.000Z"
 provenance:
-  source: Anatomy by X4MU-L
-  upstream_url: https://github.com/X4MU-L/anatomy
+  source: Anatomy by wheresryan22
+  upstream_url: https://github.com/wheresryan22/anatomy
   adapted_by: Aethra Workbench
 ---
 
@@ -47,7 +47,7 @@ mechanisms, architectures, and data flows through visual metaphors.
 
 ## When to use
 
-Use Anatomy when the task involves:
+Use Anatomy when the task involves crafted, metaphor-based explanatory visuals:
 
 - Explaining a database connection pool or caching mechanism
 - Visualizing a processing pipeline as a crafted machine
@@ -59,10 +59,12 @@ Use Anatomy when the task involves:
 
 Do not use Anatomy for:
 
+- Standard architecture diagrams, ER diagrams, or class hierarchies (use Mermaid or D2 instead)
+- System flowcharts or sequence diagrams (use Mermaid instead)
 - Ordinary dashboards or admin interfaces
 - Conventional checkout or form UI
 - Navigation redesigns
-- General data visualizations (use chart libraries)
+- General data visualizations (use chart libraries like Recharts, Chart.js, or Vega)
 - Pages whose main purpose is transactional interaction
 
 ## Workflow

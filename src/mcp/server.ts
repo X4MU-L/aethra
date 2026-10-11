@@ -38,6 +38,8 @@ import {
   dbLoadFeedback,
   dbListPlans,
   dbGetSessionsForClient,
+  dbFindFeedbackByProviderAnnotation,
+  dbUpdateFeedbackLifecycle,
 } from "../engine/db.js";
 
 // ─── Server setup ─────────────────────────────────────────────────────────────
@@ -999,6 +1001,55 @@ function getWorkspaceSessionScope(): {
   return { clientSlug, mappedSessions };
 }
 
+/** Verify that an annotation belongs to one of this workspace's mapped sessions. */
+async function verifyAnnotationWorkspaceOwnership(
+  annotationId: string,
+): Promise<{ authorized: boolean; reason?: string }> {
+  const { clientSlug, mappedSessions } = getWorkspaceSessionScope();
+  const db = getDb(workspacePath);
+
+  // 1. Check local DB
+  const localFb =
+    dbFindFeedbackByProviderAnnotation(db, "agentation", annotationId, clientSlug) ??
+    dbLoadFeedback(db, annotationId);
+
+  if (localFb) {
+    if (localFb.clientId === clientSlug) {
+      return { authorized: true };
+    }
+    return {
+      authorized: false,
+      reason: `Annotation belongs to client "${localFb.clientId}", not current workspace client "${clientSlug}"`,
+    };
+  }
+
+  // 2. Not in local DB — check upstream annotation's session
+  try {
+    const res = await fetch(`${AGENTATION_BASE}/annotations/${annotationId}`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) {
+      return {
+        authorized: false,
+        reason: `Annotation ${annotationId} not found on Agentation server (HTTP ${res.status})`,
+      };
+    }
+    const ann = (await res.json()) as { sessionId?: string };
+    if (!ann.sessionId || !mappedSessions.includes(ann.sessionId)) {
+      return {
+        authorized: false,
+        reason: `Annotation ${annotationId} belongs to session ${ann.sessionId ?? "unknown"}, which is not mapped to workspace "${clientSlug}"`,
+      };
+    }
+    return { authorized: true };
+  } catch (err) {
+    return {
+      authorized: false,
+      reason: `Failed to verify annotation session ownership: ${(err as Error).message}`,
+    };
+  }
+}
+
 /** Fetch pending annotations only from sessions mapped to this workspace. */
 async function fetchScopedPendingAnnotations(): Promise<unknown[]> {
   const { mappedSessions } = getWorkspaceSessionScope();
@@ -1015,14 +1066,18 @@ async function fetchScopedPendingAnnotations(): Promise<unknown[]> {
         { signal: AbortSignal.timeout(5000) },
       );
       if (!res.ok) continue;
-      const annotations = await res.json();
-      if (Array.isArray(annotations)) {
-        allPending.push(
-          ...annotations.map((a: Record<string, unknown>) => ({
-            ...a,
-            sessionId,
-          })),
-        );
+      const data = await res.json();
+      const annotations = Array.isArray(data)
+        ? data
+        : Array.isArray((data as { annotations?: unknown[] })?.annotations)
+          ? (data as { annotations: unknown[] }).annotations
+          : [];
+
+      for (const a of annotations) {
+        allPending.push({
+          ...(a as Record<string, unknown>),
+          sessionId,
+        });
       }
     } catch {
       // Skip failing sessions
@@ -1120,10 +1175,15 @@ async function handleWatchAnnotations(timeoutSeconds?: number) {
             { signal: AbortSignal.timeout(3000) },
           );
           if (!res.ok) continue;
-          const annotations = (await res.json()) as Array<
-            Record<string, unknown>
-          >;
-          for (const ann of annotations) {
+          const data = await res.json();
+          const annotations = Array.isArray(data)
+            ? data
+            : Array.isArray((data as { annotations?: unknown[] })?.annotations)
+              ? (data as { annotations: unknown[] }).annotations
+              : [];
+
+          for (const rawAnn of annotations) {
+            const ann = rawAnn as Record<string, unknown>;
             const id = String(ann.id ?? "");
             if (id && !seenIds.has(id)) {
               seenIds.add(id);
@@ -1166,21 +1226,51 @@ async function handleResolveAnnotation(annotationId: string, summary?: string) {
     return errorResult("Agentation server not available.");
   }
 
+  const auth = await verifyAnnotationWorkspaceOwnership(annotationId);
+  if (!auth.authorized) {
+    return errorResult(`Permission denied: ${auth.reason}`);
+  }
+
   try {
     const res = await fetch(`${AGENTATION_BASE}/annotations/${annotationId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        isFixed: true,
-        resolution: summary ?? "Resolved",
+        status: "resolved",
+        resolvedBy: "agent",
       }),
       signal: AbortSignal.timeout(5000),
     });
 
     if (!res.ok) {
       return errorResult(
-        `Failed to resolve annotation ${annotationId}: ${res.status}`,
+        `Failed to resolve annotation ${annotationId}: HTTP ${res.status}`,
       );
+    }
+
+    if (summary) {
+      await fetch(`${AGENTATION_BASE}/annotations/${annotationId}/thread`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          role: "agent",
+          content: `Resolved: ${summary}`,
+        }),
+        signal: AbortSignal.timeout(5000),
+      }).catch(() => { });
+    }
+
+    // Sync local DB record if present
+    const db = getDb(workspacePath);
+    const { clientSlug } = getWorkspaceSessionScope();
+    const local =
+      dbFindFeedbackByProviderAnnotation(db, "agentation", annotationId, clientSlug) ??
+      dbLoadFeedback(db, annotationId);
+    if (local) {
+      dbUpdateFeedbackLifecycle(db, local.id, {
+        status: "resolved",
+        resolutionSummary: summary ?? "Resolved",
+      });
     }
 
     return {
@@ -1204,18 +1294,49 @@ async function handleDismissAnnotation(annotationId: string, reason: string) {
     return errorResult("Agentation server not available.");
   }
 
+  const auth = await verifyAnnotationWorkspaceOwnership(annotationId);
+  if (!auth.authorized) {
+    return errorResult(`Permission denied: ${auth.reason}`);
+  }
+
   try {
     const res = await fetch(`${AGENTATION_BASE}/annotations/${annotationId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ dismissed: true, dismissReason: reason }),
+      body: JSON.stringify({
+        status: "dismissed",
+        resolvedBy: "agent",
+      }),
       signal: AbortSignal.timeout(5000),
     });
 
     if (!res.ok) {
       return errorResult(
-        `Failed to dismiss annotation ${annotationId}: ${res.status}`,
+        `Failed to dismiss annotation ${annotationId}: HTTP ${res.status}`,
       );
+    }
+
+    await fetch(`${AGENTATION_BASE}/annotations/${annotationId}/thread`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        role: "agent",
+        content: `Dismissed: ${reason}`,
+      }),
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => { });
+
+    // Sync local DB record if present
+    const db = getDb(workspacePath);
+    const { clientSlug } = getWorkspaceSessionScope();
+    const local =
+      dbFindFeedbackByProviderAnnotation(db, "agentation", annotationId, clientSlug) ??
+      dbLoadFeedback(db, annotationId);
+    if (local) {
+      dbUpdateFeedbackLifecycle(db, local.id, {
+        status: "dismissed",
+        resolutionSummary: `Dismissed: ${reason}`,
+      });
     }
 
     return {
@@ -1240,20 +1361,25 @@ async function handleReplyAnnotation(annotationId: string, message: string) {
     return errorResult("Agentation server not available.");
   }
 
+  const auth = await verifyAnnotationWorkspaceOwnership(annotationId);
+  if (!auth.authorized) {
+    return errorResult(`Permission denied: ${auth.reason}`);
+  }
+
   try {
     const res = await fetch(
       `${AGENTATION_BASE}/annotations/${annotationId}/thread`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, role: "agent" }),
+        body: JSON.stringify({ role: "agent", content: message }),
         signal: AbortSignal.timeout(5000),
       },
     );
 
     if (!res.ok) {
       return errorResult(
-        `Failed to reply to annotation ${annotationId}: ${res.status}`,
+        `Failed to reply to annotation ${annotationId}: HTTP ${res.status}`,
       );
     }
 

@@ -19,6 +19,7 @@ import {
 } from "../../design/design-brief.js";
 import { evaluateDesign, saveCritique } from "../../design/critic.js";
 import { readJson, pathExists } from "../../engine/fs.js";
+import { loadClientFacts } from "../../engine/workspace.js";
 import { logger } from "../../core/logger.js";
 import { toAethraError } from "../../core/errors.js";
 import type { DesignDirection } from "../../core/schemas.js";
@@ -90,12 +91,11 @@ export function registerDesignCommand(program: Command): void {
         if (clientSlug) {
           try {
             const { workspacePath } = await resolveClientWorkspace(clientSlug);
-            const factsPath = path.join(workspacePath, "client-facts.json");
-            if (await pathExists(factsPath)) {
-              const facts = await readJson<Record<string, unknown>>(factsPath);
+            const facts = await loadClientFacts(workspacePath);
+            if (facts) {
               clientFacts = {
-                constraints: (facts.constraints as string[]) ?? [],
-                desiredOutcomes: (facts.desiredOutcomes as string[]) ?? [],
+                constraints: facts.constraints ?? [],
+                desiredOutcomes: facts.objectives ?? [],
               };
             }
           } catch {
@@ -261,19 +261,29 @@ export function registerDesignCommand(program: Command): void {
           );
         }
 
-        // Look for screenshots
+        // Look for screenshots (check both root and run-specific subdirectories)
         const screenshotsDir = path.join(
           workspacePath,
           "evidence",
           "screenshots",
         );
-        let screenshotPaths: string[] = [];
+        const screenshotPaths: string[] = [];
         if (await pathExists(screenshotsDir)) {
           const { promises: fs } = await import("fs");
-          const entries = await fs.readdir(screenshotsDir);
-          screenshotPaths = entries
-            .filter((f) => /\.(png|jpg|jpeg|webp)$/i.test(f))
-            .map((f) => path.join(screenshotsDir, f));
+          const entries = await fs.readdir(screenshotsDir, { withFileTypes: true });
+          for (const entry of entries) {
+            const fullPath = path.join(screenshotsDir, entry.name);
+            if (entry.isFile() && /\.(png|jpg|jpeg|webp)$/i.test(entry.name)) {
+              screenshotPaths.push(fullPath);
+            } else if (entry.isDirectory()) {
+              const subEntries = await fs.readdir(fullPath);
+              for (const sub of subEntries) {
+                if (/\.(png|jpg|jpeg|webp)$/i.test(sub)) {
+                  screenshotPaths.push(path.join(fullPath, sub));
+                }
+              }
+            }
+          }
         }
 
         if (screenshotPaths.length === 0) {

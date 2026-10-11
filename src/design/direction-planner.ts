@@ -167,15 +167,22 @@ export function generateDesignDirections(
   count: number = 4,
   seed?: number,
 ): DesignDirection[] {
-  const rng = mulberry32(seed ?? Date.now());
+  const safeCount =
+    typeof count === "number" && !isNaN(count) && count > 0
+      ? Math.max(1, Math.min(Math.floor(count), 50))
+      : 4;
+  const safeSeed =
+    typeof seed === "number" && !isNaN(seed) ? seed : undefined;
+
+  const rng = mulberry32(safeSeed ?? Date.now());
   const combos = allCombinations();
 
   // Pick the first direction randomly
   const firstIdx = Math.floor(rng() * combos.length);
-  const selected: string[][] = [combos[firstIdx]];
+  const selected: string[][] = [combos[firstIdx]!];
 
   // Greedily select subsequent directions that maximize minimum Hamming distance
-  for (let i = 1; i < count && i < combos.length; i++) {
+  for (let i = 1; i < safeCount && i < combos.length; i++) {
     let bestCombo: string[] | undefined;
     let bestMinDist = -1;
 
@@ -202,8 +209,8 @@ export function generateDesignDirections(
     const id = crypto.randomBytes(8).toString("hex");
     const axes = AXIS_NAMES.map((axisName, i) => ({
       axis: axisName,
-      position: positions[i],
-      description: AXIS_DESCRIPTIONS[axisName]?.[positions[i]] ?? positions[i],
+      position: positions[i]!,
+      description: AXIS_DESCRIPTIONS[axisName]?.[positions[i]!] ?? positions[i]!,
     }));
 
     return {
@@ -231,37 +238,68 @@ export function planDesignDirections(
   const constraints = clientFacts?.constraints ?? [];
   const outcomes = clientFacts?.desiredOutcomes ?? [];
 
-  // Build a constraint-match map: axis position keywords that conflict
-  const constraintKeywords = constraints.flatMap((c) =>
-    c.toLowerCase().split(/\s+/),
-  );
+  // Parse prohibitive constraint keywords (e.g. "no animations", "avoid serif")
+  // Prevents positive keywords like "must look modern" from accidentally disqualifying "modern" directions
+  const prohibitivePatterns = [
+    /\bno\s+([a-z-]+)/i,
+    /\bavoid\s+([a-z-]+)/i,
+    /\bdo not use\s+([a-z-]+)/i,
+    /\bdon't use\s+([a-z-]+)/i,
+    /\bnever\s+([a-z-]+)/i,
+    /\bwithout\s+([a-z-]+)/i,
+    /\bprohibit\s+([a-z-]+)/i,
+  ];
 
-  const enriched = directions
-    .filter((dir) => {
-      // Filter out directions whose axis positions conflict with constraints
-      for (const axis of dir.axes) {
-        const positionWords = axis.position.toLowerCase().split("-");
-        for (const word of positionWords) {
-          if (constraintKeywords.includes(word) && word.length > 3) {
-            return false;
-          }
+  const prohibitedWords: string[] = [];
+  for (const c of constraints) {
+    for (const pat of prohibitivePatterns) {
+      const match = c.match(pat);
+      if (match?.[1]) {
+        prohibitedWords.push(match[1].toLowerCase());
+      }
+    }
+  }
+
+  const filtered = directions.filter((dir) => {
+    if (prohibitedWords.length === 0) return true;
+    for (const axis of dir.axes) {
+      const positionWords = axis.position.toLowerCase().split("-");
+      for (const word of positionWords) {
+        if (prohibitedWords.includes(word) && word.length > 2) {
+          return false;
         }
       }
-      return true;
-    })
-    .map((dir, idx) => {
-      // Enrich rationale with task context
-      const outcomeNote =
-        outcomes.length > 0
-          ? ` Supports outcomes: ${outcomes.slice(0, 2).join("; ")}.`
-          : "";
+    }
+    return true;
+  });
 
-      return {
-        ...dir,
-        rationale: `${dir.rationale} Designed for: ${taskDescription.slice(0, 120)}.${outcomeNote}`,
-        priority: idx + 1,
-      };
-    });
+  // If constraints eliminate all directions, gracefully fall back to base directions
+  const candidates = filtered.length > 0 ? filtered : directions;
+
+  const enriched = candidates.map((dir, idx) => {
+    const dominantVisual =
+      dir.axes.find((a) => a.axis === "layout-density")?.position ?? "standard";
+    const typoStyle =
+      dir.axes.find((a) => a.axis === "typography-character")?.position ??
+      "modern";
+    const colorStyle =
+      dir.axes.find((a) => a.axis === "color-temperature")?.position ??
+      "balanced";
+
+    const taskContext = taskDescription.trim()
+      ? ` Tailored to task "${taskDescription.slice(0, 80)}".`
+      : "";
+    const outcomeNote =
+      outcomes.length > 0
+        ? ` Aims to advance client outcomes: ${outcomes.slice(0, 2).join("; ")}.`
+        : "";
+
+    return {
+      ...dir,
+      rationale: `Explores a ${dominantVisual} composition with ${typoStyle} typography and a ${colorStyle} palette.${taskContext}${outcomeNote}`,
+      priority: idx + 1,
+    };
+  });
 
   return enriched;
 }

@@ -279,3 +279,101 @@ describe("startSession", () => {
     expect(result.error).toMatch(/local\/development/);
   });
 });
+
+// ─── Upstream API shape normalizers ──────────────────────────────────────────
+
+describe("upstream API shape normalizations", () => {
+  it("normalizes cssClasses as a space-separated string from upstream", () => {
+    const raw = makeRawAnnotation({
+      cssClasses: "btn btn-primary active",
+    });
+    const result = provider.normalize(raw, "test-client");
+    expect(result.cssClasses).toEqual(["btn", "btn-primary", "active"]);
+  });
+
+  it("normalizes reactComponents as a breadcrumb string from upstream", () => {
+    const raw = makeRawAnnotation({
+      reactComponents: "Header > Nav > NavItem",
+    });
+    const result = provider.normalize(raw, "test-client");
+    expect(result.componentTree).toEqual(["Header", "Nav", "NavItem"]);
+  });
+
+  it("normalizes computedStyles as CSS declaration string", () => {
+    const raw = makeRawAnnotation({
+      computedStyles: "color: rgb(255, 0, 0); font-size: 16px; margin: 0px;",
+    });
+    const result = provider.normalize(raw, "test-client");
+    expect(result.computedStyles).toEqual({
+      color: "rgb(255, 0, 0)",
+      "font-size": "16px",
+      margin: "0px",
+    });
+  });
+
+  it("normalizes computedStyles from JSON object", () => {
+    const raw = makeRawAnnotation({
+      computedStyles: { color: "#fff", display: "flex" },
+    });
+    const result = provider.normalize(raw, "test-client");
+    expect(result.computedStyles).toEqual({
+      color: "#fff",
+      display: "flex",
+    });
+  });
+
+  it("normalizes accessibility string into structured object", () => {
+    const raw = makeRawAnnotation({
+      accessibility: "Submit Order Button",
+    });
+    const result = provider.normalize(raw, "test-client");
+    expect(result.accessibilityContext).toEqual({
+      ariaLabel: "Submit Order Button",
+    });
+  });
+
+  it("preserves structured placement with componentType, scrollY, text", () => {
+    const raw = makeRawAnnotation({
+      kind: "placement",
+      placement: {
+        componentType: "PromoBanner",
+        scrollY: 350,
+        text: "Special offer",
+      },
+    });
+    const result = provider.normalize(raw, "test-client");
+    expect(result.kind).toBe("style");
+    expect(result.providerMetadata?.originalKind).toBe("placement");
+    expect(result.providerMetadata?.placement).toEqual({
+      componentType: "PromoBanner",
+      scrollY: 350,
+      text: "Special offer",
+    });
+  });
+
+  it("preserves structured rearrange with originalRect and currentRect", () => {
+    const raw = makeRawAnnotation({
+      kind: "rearrange",
+      rearrange: {
+        selector: "#hero-title",
+        originalRect: { x: 10, y: 20, width: 300, height: 60 },
+        currentRect: { x: 10, y: 80, width: 300, height: 60 },
+      },
+    });
+    const result = provider.normalize(raw, "test-client");
+    expect(result.kind).toBe("enhancement");
+    expect(result.providerMetadata?.originalKind).toBe("rearrange");
+    expect(result.providerMetadata?.rearrange).toEqual({
+      selector: "#hero-title",
+      originalRect: { x: 10, y: 20, width: 300, height: 60 },
+      currentRect: { x: 10, y: 80, width: 300, height: 60 },
+    });
+  });
+
+  it("throws VisualFeedbackError if url is missing", () => {
+    const raw = makeRawAnnotation({ url: undefined });
+    expect(() => provider.normalize(raw, "test-client")).toThrow(
+      VisualFeedbackError,
+    );
+  });
+});

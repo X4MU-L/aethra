@@ -43,7 +43,7 @@ export function registerInvestigateCommand(program: Command): void {
         const { config, workspacePath } = await resolveClientWorkspace(clientSlug);
 
         // ─── Resolve task (if --task given) ─────────────────────────────────
-        let taskRecord = opts.task
+        const taskRecord = opts.task
           ? await findTaskByPrefix(workspacePath, opts.task as string)
           : null;
 

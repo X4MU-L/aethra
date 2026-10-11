@@ -13,11 +13,12 @@ import { queryOutput } from "../../engine/subprocess.js";
 import { readJson, pathExists } from "../../engine/fs.js";
 import {
   findTaskByPrefix,
-  transitionTask,
   updateTask,
 } from "../../engine/tasks.js";
 import { getDefaultAdapter } from "../../agents/registry.js";
-import { selectSkillsForTask } from "../../engine/context.js";
+import { selectSkillsForTaskEnhanced } from "../../engine/context.js";
+import { classifyTask } from "../../design/task-classifier.js";
+import { getCapabilitiesForTask } from "../../tools/capability-registry.js";
 import { logger } from "../../core/logger.js";
 import { toAethraError, WorkspaceError } from "../../core/errors.js";
 import type { ImplementationPlan } from "../../core/schemas.js";
@@ -142,10 +143,6 @@ export function registerApplyFixCommand(program: Command): void {
               "\n  ⚠ No repository configured. Configure repositoryPath in client.yaml.\n",
             ),
           );
-          // Still mark task as in-progress so state machine progresses
-          if (taskId) {
-            await transitionTask(workspacePath, taskId, "in-progress");
-          }
         } else {
           if (!(await pathExists(repoPath))) {
             throw new WorkspaceError(`Repository path not found: ${repoPath}`);
@@ -161,31 +158,47 @@ export function registerApplyFixCommand(program: Command): void {
           console.log(chalk.gray(`  Branch: ${gitStatus.branch}`));
 
           if (gitStatus.hasUncommittedChanges) {
-            console.log(
-              chalk.yellow("\n  ⚠ Repository has uncommitted changes:"),
-            );
-            if (gitStatus.modifiedFiles.length > 0) {
+            if (!opts.force) {
+              logger.error(
+                "Repository has uncommitted changes. Implementation requires branch isolation. " +
+                  "Commit or stash your changes, or use --force to proceed without branch isolation.",
+              );
               console.log(
-                chalk.yellow(
-                  `    Modified: ${gitStatus.modifiedFiles.slice(0, 5).join(", ")}`,
+                chalk.red(
+                  "\n  ✗ Uncommitted changes detected in repository:\n",
                 ),
               );
-            }
-            if (gitStatus.stagedFiles.length > 0) {
+              if (gitStatus.modifiedFiles.length > 0) {
+                console.log(
+                  chalk.yellow(
+                    `    Modified: ${gitStatus.modifiedFiles.slice(0, 5).join(", ")}`,
+                  ),
+                );
+              }
+              if (gitStatus.stagedFiles.length > 0) {
+                console.log(
+                  chalk.yellow(
+                    `    Staged:   ${gitStatus.stagedFiles.slice(0, 5).join(", ")}`,
+                  ),
+                );
+              }
               console.log(
-                chalk.yellow(
-                  `    Staged: ${gitStatus.stagedFiles.slice(0, 5).join(", ")}`,
+                chalk.gray(
+                  "\n  Resolve uncommitted changes with `git commit` or `git stash` and re-run.",
                 ),
               );
+              console.log(
+                chalk.gray(
+                  "  To bypass branch isolation intentionally, use: aethra apply-fix --force\n",
+                ),
+              );
+              process.exit(1);
             }
+
             console.log(
               chalk.yellow(
-                "\n  These changes will be preserved. Branch creation skipped — commit or stash first.",
-              ),
-            );
-            console.log(
-              chalk.yellow(
-                "  To create a feature branch, resolve uncommitted changes and re-run apply-fix.",
+                "\n  ⚠ Proceeding with uncommitted changes (--force specified). " +
+                  "Branch creation skipped to preserve working tree.\n",
               ),
             );
           }
@@ -264,12 +277,31 @@ export function registerApplyFixCommand(program: Command): void {
         const adapter = getDefaultAdapter();
         const repoPathResolved = config.repositoryPath ?? process.cwd();
 
-        // Select relevant skills for the task
-        const skillSelection = await selectSkillsForTask(
+        // Classify task and check tool capabilities
+        const classification = classifyTask(
+          plan.taskDescription,
+          config.platform,
+        );
+        const capabilities = getCapabilitiesForTask(
+          classification.classification,
+          config.platform,
+        );
+        const unavailable = capabilities.filter(
+          (c) => c.status === "unavailable" || c.status === "requires-setup",
+        );
+        if (unavailable.length > 0) {
+          logger.warn(
+            `Capabilities requiring setup: ${unavailable.map((c) => c.name).join(", ")}`,
+          );
+        }
+
+        // Select relevant skills for the task using enhanced classifier-aware selection
+        const skillSelection = await selectSkillsForTaskEnhanced(
           plan.taskDescription,
           config.platform,
           "implement",
           path.join(workspacePath, "skills"),
+          { taskClassification: classification },
         );
 
         const agentResult = await adapter.launch(
