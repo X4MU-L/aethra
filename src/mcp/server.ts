@@ -1287,6 +1287,20 @@ server.setRequestHandler(SubscribeRequestSchema, async (request) => {
 let sseBridgeActive = false;
 let sseBridgeAbort: AbortController | null = null;
 
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(new DOMException("Aborted", "AbortError"));
+      },
+      { once: true },
+    );
+  });
+}
+
 async function startSseBridge(): Promise<void> {
   if (sseBridgeActive) return;
   if (!(await ensureAgentationServer())) return;
@@ -1294,69 +1308,88 @@ async function startSseBridge(): Promise<void> {
   sseBridgeActive = true;
   sseBridgeAbort = new AbortController();
 
-  const connectSse = async () => {
-    try {
-      const res = await fetch(`${AGENTATION_BASE}/events`, {
-        headers: { Accept: "text/event-stream" },
-        signal: sseBridgeAbort!.signal,
-      });
+  const runBridge = async () => {
+    let backoffMs = 1000;
+    const MAX_BACKOFF = 30_000;
 
-      if (!res.ok || !res.body) {
+    while (sseBridgeActive && !sseBridgeAbort!.signal.aborted) {
+      try {
+        const res = await fetch(`${AGENTATION_BASE}/events`, {
+          headers: { Accept: "text/event-stream" },
+          signal: sseBridgeAbort!.signal,
+        });
+
+        if (!res.ok || !res.body) {
+          process.stderr.write(
+            `Agentation SSE: failed to connect (${res.status}), retrying in ${backoffMs}ms\n`,
+          );
+          await abortableSleep(backoffMs, sseBridgeAbort!.signal);
+          backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
+          continue;
+        }
+
+        // Connected — reset backoff
+        backoffMs = 1000;
         process.stderr.write(
-          `Agentation SSE: failed to connect (${res.status})\n`,
+          "Agentation SSE bridge active — annotations will push to agent\n",
         );
-        sseBridgeActive = false;
-        return;
-      }
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
 
-      process.stderr.write(
-        "Agentation SSE bridge active — annotations will push to agent\n",
-      );
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            try {
-              const event = JSON.parse(line.slice(6));
-              if (
-                event.type === "annotation.created" ||
-                event.type === "annotation.updated"
-              ) {
-                // Notify the agent that the pending annotations resource has changed
-                await server.sendResourceUpdated({
-                  uri: PENDING_ANNOTATIONS_URI,
-                });
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              try {
+                const event = JSON.parse(line.slice(6));
+                if (
+                  event.type === "annotation.created" ||
+                  event.type === "annotation.updated"
+                ) {
+                  await server.sendResourceUpdated({
+                    uri: PENDING_ANNOTATIONS_URI,
+                  });
+                }
+              } catch {
+                // Skip malformed SSE data
               }
-            } catch {
-              // Skip malformed SSE data
             }
           }
         }
-      }
-    } catch (err) {
-      if ((err as Error).name !== "AbortError") {
+
+        // Stream ended normally — reconnect
+        process.stderr.write("Agentation SSE: stream ended, reconnecting...\n");
+      } catch (err) {
+        if ((err as Error).name === "AbortError") {
+          break; // Intentional shutdown
+        }
         process.stderr.write(
-          `Agentation SSE bridge disconnected: ${(err as Error).message}\n`,
+          `Agentation SSE bridge error: ${(err as Error).message}, retrying in ${backoffMs}ms\n`,
         );
       }
+
+      // Wait before reconnecting
+      try {
+        await abortableSleep(backoffMs, sseBridgeAbort!.signal);
+      } catch {
+        break; // Aborted during sleep
+      }
+      backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
     }
 
     sseBridgeActive = false;
   };
 
   // Run in background — don't await
-  connectSse();
+  runBridge();
 }
 
 // ─── Start server ─────────────────────────────────────────────────────────────

@@ -9,12 +9,14 @@ import { resolveClientWorkspace } from "../../config/manager.js";
 import {
   listFeedback,
   loadFeedback,
+  saveFeedback,
   importFeedback,
   linkFeedbackToTask,
   resolveFeedback,
   createPlanFromFeedback,
   getAllProviderStatus,
 } from "../../visual-feedback/manager.js";
+import { getProvider } from "../../visual-feedback/providers/registry.js";
 import { logger } from "../../core/logger.js";
 import { toAethraError } from "../../core/errors.js";
 
@@ -577,9 +579,12 @@ export function registerFeedbackCommand(program: Command): void {
 
   feedback
     .command("watch")
-    .description("Poll for new feedback at regular intervals")
+    .description(
+      "Watch for new feedback (real-time SSE for agentation, polling for others)",
+    )
     .option("--provider <name>", "Provider to watch")
     .option("--interval <seconds>", "Polling interval in seconds", "10")
+    .option("--port <port>", "Agentation server port", "4747")
     .option("--client <slug>", "Specify client by slug")
     .action(async (opts, cmd) => {
       const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
@@ -595,76 +600,224 @@ export function registerFeedbackCommand(program: Command): void {
           chalk.bold.blue(`\n  Watching for feedback — ${config.name}\n`),
         );
         console.log(chalk.gray(`  Provider: ${providerName}`));
-        console.log(chalk.gray(`  Interval: ${opts.interval}s`));
-        console.log(chalk.gray("  Press Ctrl+C to stop.\n"));
 
         const ora = (await import("ora")).default;
-        const spinner = ora({
-          text: "Polling for feedback...",
-          color: "cyan",
-        }).start();
-
         let running = true;
         let totalImported = 0;
 
-        const shutdown = (): void => {
-          running = false;
-          spinner.stop();
-          console.log(
-            chalk.gray(
-              `\n  Stopped. ${totalImported} item(s) imported total.\n`,
-            ),
-          );
-          process.exit(0);
-        };
-
-        process.on("SIGINT", shutdown);
-        process.on("SIGTERM", shutdown);
-
-        while (running) {
-          try {
-            const result = await importFeedback(
-              workspacePath,
-              slug,
-              providerName,
+        if (providerName === "agentation") {
+          // ── Agentation: real-time SSE + polling fallback ──────────────────
+          const provider = getProvider("agentation");
+          if (
+            !provider ||
+            !("startServer" in provider) ||
+            !("subscribeToEvents" in provider)
+          ) {
+            logger.error(
+              "Agentation provider not available. Install agentation-mcp.",
             );
+            process.exit(1);
+          }
 
-            if (result.imported.length > 0) {
-              totalImported += result.imported.length;
+          // Type-narrow to access Agentation-specific methods
+          const agProvider = provider as typeof provider & {
+            setContext: (wp: string) => void;
+            startServer: (port: number) => Promise<void>;
+            stopServer: () => Promise<void>;
+            subscribeToEvents: (
+              cb: (ann: Record<string, unknown>) => void,
+            ) => Promise<void>;
+          };
+
+          const port = parseInt(opts.port, 10);
+          console.log(chalk.gray(`  Port: ${port}`));
+          console.log(chalk.gray(`  Fallback polling: ${opts.interval}s`));
+          console.log(chalk.gray("  Press Ctrl+C to stop.\n"));
+
+          agProvider.setContext(workspacePath);
+
+          try {
+            await agProvider.startServer(port);
+            console.log(
+              chalk.green(`  Agentation server started on port ${port}`),
+            );
+          } catch (err) {
+            logger.error(
+              `Failed to start Agentation server: ${(err as Error).message}`,
+            );
+            process.exit(1);
+          }
+
+          // Create a session mapping so retrievePending can find annotations
+          const crypto = await import("crypto");
+          const sessionId = crypto.randomBytes(8).toString("hex");
+          const pageUrl =
+            config.primaryUrl ?? config.localUrl ?? "http://localhost:3000";
+          await provider.startSession({
+            pageUrl,
+            clientSlug: slug,
+            sessionId,
+          });
+          console.log(chalk.gray(`  Session: ${sessionId} → ${pageUrl}`));
+
+          const spinner = ora({
+            text: "Listening for annotations (real-time + polling fallback)...",
+            color: "cyan",
+          }).start();
+
+          // Shutdown handler — stop server before exit
+          const shutdown = (): void => {
+            running = false;
+            spinner.stop();
+            agProvider.stopServer().catch(() => {});
+            console.log(
+              chalk.gray(
+                `\n  Stopped. ${totalImported} item(s) imported total.\n`,
+              ),
+            );
+            process.exit(0);
+          };
+
+          process.on("SIGINT", shutdown);
+          process.on("SIGTERM", shutdown);
+
+          // Subscribe to SSE events for real-time annotations
+          await agProvider.subscribeToEvents((rawAnnotation) => {
+            try {
+              const feedback = provider.normalize(
+                rawAnnotation as { id: string; [key: string]: unknown },
+                slug,
+              );
+              saveFeedback(workspacePath, feedback).catch(() => {});
+              totalImported++;
               spinner.stop();
               console.log(
                 chalk.green(
-                  `  +${result.imported.length} new item(s) imported (total: ${totalImported})`,
+                  `  +1 annotation (real-time) — total: ${totalImported}`,
                 ),
               );
-              for (const item of result.imported) {
+              console.log(
+                chalk.gray(
+                  `    ${feedback.id.slice(0, 8)}  ${feedback.comment.slice(0, 60)}`,
+                ),
+              );
+              spinner.start(
+                "Listening for annotations (real-time + polling fallback)...",
+              );
+            } catch (err) {
+              logger.warn(`SSE annotation error: ${(err as Error).message}`);
+            }
+          });
+
+          // Slower polling loop as safety net
+          const fallbackIntervalMs = Math.max(intervalMs, 30000);
+          while (running) {
+            if (running) {
+              await new Promise<void>((resolve) =>
+                setTimeout(resolve, fallbackIntervalMs),
+              );
+            }
+            if (!running) break;
+
+            try {
+              const result = await importFeedback(
+                workspacePath,
+                slug,
+                providerName,
+              );
+
+              if (result.imported.length > 0) {
+                totalImported += result.imported.length;
+                spinner.stop();
                 console.log(
-                  chalk.gray(
-                    `    ${item.id.slice(0, 8)}  ${item.comment.slice(0, 60)}`,
+                  chalk.green(
+                    `  +${result.imported.length} item(s) via poll (total: ${totalImported})`,
                   ),
                 );
+                for (const item of result.imported) {
+                  console.log(
+                    chalk.gray(
+                      `    ${item.id.slice(0, 8)}  ${item.comment.slice(0, 60)}`,
+                    ),
+                  );
+                }
+                spinner.start(
+                  "Listening for annotations (real-time + polling fallback)...",
+                );
               }
-              spinner.start("Polling for feedback...");
+            } catch (pollErr) {
+              logger.warn(`Poll fallback error: ${(pollErr as Error).message}`);
             }
-
-            if (result.errors.length > 0) {
-              spinner.stop();
-              for (const err of result.errors) {
-                console.log(chalk.red(`  Error: ${err}`));
-              }
-              spinner.start("Polling for feedback...");
-            }
-          } catch (pollErr) {
-            spinner.stop();
-            logger.warn(`Poll error: ${(pollErr as Error).message}`);
-            spinner.start("Polling for feedback...");
           }
+        } else {
+          // ── Other providers: polling only ──────────────────────────────────
+          console.log(chalk.gray(`  Interval: ${opts.interval}s`));
+          console.log(chalk.gray("  Press Ctrl+C to stop.\n"));
 
-          // Wait for interval
-          if (running) {
-            await new Promise<void>((resolve) =>
-              setTimeout(resolve, intervalMs),
+          const spinner = ora({
+            text: "Polling for feedback...",
+            color: "cyan",
+          }).start();
+
+          const shutdown = (): void => {
+            running = false;
+            spinner.stop();
+            console.log(
+              chalk.gray(
+                `\n  Stopped. ${totalImported} item(s) imported total.\n`,
+              ),
             );
+            process.exit(0);
+          };
+
+          process.on("SIGINT", shutdown);
+          process.on("SIGTERM", shutdown);
+
+          while (running) {
+            try {
+              const result = await importFeedback(
+                workspacePath,
+                slug,
+                providerName,
+              );
+
+              if (result.imported.length > 0) {
+                totalImported += result.imported.length;
+                spinner.stop();
+                console.log(
+                  chalk.green(
+                    `  +${result.imported.length} new item(s) imported (total: ${totalImported})`,
+                  ),
+                );
+                for (const item of result.imported) {
+                  console.log(
+                    chalk.gray(
+                      `    ${item.id.slice(0, 8)}  ${item.comment.slice(0, 60)}`,
+                    ),
+                  );
+                }
+                spinner.start("Polling for feedback...");
+              }
+
+              if (result.errors.length > 0) {
+                spinner.stop();
+                for (const err of result.errors) {
+                  console.log(chalk.red(`  Error: ${err}`));
+                }
+                spinner.start("Polling for feedback...");
+              }
+            } catch (pollErr) {
+              spinner.stop();
+              logger.warn(`Poll error: ${(pollErr as Error).message}`);
+              spinner.start("Polling for feedback...");
+            }
+
+            // Wait for interval
+            if (running) {
+              await new Promise<void>((resolve) =>
+                setTimeout(resolve, intervalMs),
+              );
+            }
           }
         }
       } catch (err) {

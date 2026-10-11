@@ -461,62 +461,100 @@ export class AgentationProvider extends VisualFeedbackProvider {
   ): Promise<void> {
     this.sseAbort = new AbortController();
 
-    try {
-      const res = await fetch(`${this.baseUrl}/events`, {
-        headers: { Accept: "text/event-stream" },
-        signal: this.sseAbort.signal,
-      });
+    const runLoop = async () => {
+      let backoffMs = 1000;
+      const MAX_BACKOFF = 30_000;
 
-      if (!res.ok || !res.body) {
-        logger.warn(`Agentation SSE: failed to connect (${res.status})`);
-        return;
-      }
+      while (!this.sseAbort!.signal.aborted) {
+        try {
+          const res = await fetch(`${this.baseUrl}/events`, {
+            headers: { Accept: "text/event-stream" },
+            signal: this.sseAbort!.signal,
+          });
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
+          if (!res.ok || !res.body) {
+            logger.warn(
+              `Agentation SSE: failed to connect (${res.status}), retrying in ${backoffMs}ms`,
+            );
+            await this.abortableSleep(backoffMs);
+            backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
+            continue;
+          }
 
-      const processStream = async () => {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+          // Connected — reset backoff
+          backoffMs = 1000;
+          logger.info("Agentation: subscribed to SSE events");
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() ?? "";
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
 
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              try {
-                const event = JSON.parse(line.slice(6));
-                if (event.type === "annotation.created" && event.annotation) {
-                  callback(event.annotation as RawAnnotation);
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+
+            for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                try {
+                  const event = JSON.parse(line.slice(6));
+                  if (event.type === "annotation.created" && event.annotation) {
+                    callback(event.annotation as RawAnnotation);
+                  }
+                } catch {
+                  // Skip malformed SSE data
                 }
-              } catch {
-                // Skip malformed SSE data
               }
             }
           }
-        }
-      };
 
-      processStream().catch((err) => {
-        if ((err as Error).name !== "AbortError") {
-          logger.warn(`Agentation SSE stream ended: ${(err as Error).message}`);
+          // Stream ended normally — reconnect
+          logger.info("Agentation SSE: stream ended, reconnecting...");
+        } catch (err) {
+          if ((err as Error).name === "AbortError") {
+            break; // Intentional shutdown
+          }
+          logger.warn(
+            `Agentation SSE error: ${(err as Error).message}, retrying in ${backoffMs}ms`,
+          );
         }
-      });
 
-      logger.info("Agentation: subscribed to SSE events");
-    } catch (err) {
-      if ((err as Error).name !== "AbortError") {
-        logger.warn(
-          `Agentation SSE: connection failed: ${(err as Error).message}`,
-        );
+        // Wait before reconnecting
+        try {
+          await this.abortableSleep(backoffMs);
+        } catch {
+          break; // Aborted during sleep
+        }
+        backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
       }
-    }
+    };
+
+    // Run in background — don't await
+    runLoop().catch((err) => {
+      if ((err as Error).name !== "AbortError") {
+        logger.warn(`Agentation SSE loop exited: ${(err as Error).message}`);
+      }
+    });
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────
+
+  private abortableSleep(ms: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, ms);
+      this.sseAbort?.signal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          reject(new DOMException("Aborted", "AbortError"));
+        },
+        { once: true },
+      );
+    });
+  }
 
   private isLocalUrl(url: string): boolean {
     try {
