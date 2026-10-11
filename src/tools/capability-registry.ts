@@ -9,6 +9,7 @@ import type {
   CapabilityStatus,
   TaskClassification,
   PlatformType,
+  WorkflowStage,
 } from "../core/schemas.js";
 
 export interface CapabilityRegistryEntry extends CapabilityEntry {
@@ -93,9 +94,9 @@ const CAPABILITY_REGISTRY: CapabilityRegistryEntry[] = [
     workflowStages: ["verify"],
     prerequisites: [],
     costClass: "model-call",
-    status: "available",
+    status: "degraded",
     async availabilityCheck() {
-      return "available"; // Always available as a stub; model integration is future
+      return "degraded"; // Stub: generates prompts but returns pending results
     },
   },
   {
@@ -189,7 +190,7 @@ export function getCapabilitiesForTask(
 }
 
 export function getCapabilitiesForStage(
-  stage: string,
+  stage: WorkflowStage,
 ): CapabilityRegistryEntry[] {
   return CAPABILITY_REGISTRY.filter((c) => c.workflowStages.includes(stage));
 }

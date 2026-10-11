@@ -475,6 +475,27 @@ export const GlobalConfigSchema = z.object({
 });
 export type GlobalConfig = z.infer<typeof GlobalConfigSchema>;
 
+// ─── Task classification ─────────────────────────────────────────────────────
+
+export const TaskClassificationSchema = z.enum([
+  "direct-fix",
+  "design-exploration",
+  "technical-illustration",
+  "conventional-engineering",
+]);
+export type TaskClassification = z.infer<typeof TaskClassificationSchema>;
+
+export const TaskClassificationResultSchema = z.object({
+  classification: TaskClassificationSchema,
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+  signals: z.array(z.string()).default([]),
+  requiresDesignWorkflow: z.boolean(),
+});
+export type TaskClassificationResult = z.infer<
+  typeof TaskClassificationResultSchema
+>;
+
 // ─── Capability registry ─────────────────────────────────────────────────────
 
 export const CapabilityStatusSchema = z.enum([
@@ -508,40 +529,67 @@ export const CostClassSchema = z.enum([
 ]);
 export type CostClass = z.infer<typeof CostClassSchema>;
 
+export const WorkflowStageSchema = z.enum([
+  "investigate",
+  "plan",
+  "implement",
+  "verify",
+]);
+export type WorkflowStage = z.infer<typeof WorkflowStageSchema>;
+
 export const CapabilityEntrySchema = z.object({
   id: z.string(),
   name: z.string(),
   category: CapabilityCategorySchema,
   description: z.string(),
-  applicableTasks: z.array(z.string()).default([]),
+  applicableTasks: z.array(TaskClassificationSchema).default([]),
   supportedPlatforms: z.array(PlatformTypeSchema).optional(),
-  workflowStages: z.array(z.string()).default([]),
+  workflowStages: z.array(WorkflowStageSchema).default([]),
   prerequisites: z.array(z.string()).default([]),
   costClass: CostClassSchema,
   status: CapabilityStatusSchema.default("available"),
 });
 export type CapabilityEntry = z.infer<typeof CapabilityEntrySchema>;
 
-// ─── Task classification ─────────────────────────────────────────────────────
+// ─── Integration metadata ────────────────────────────────────────────────────
 
-export const TaskClassificationSchema = z.enum([
-  "direct-fix",
-  "design-exploration",
-  "technical-illustration",
-  "conventional-engineering",
+export const IntegrationStatusSchema = z.enum([
+  "implemented",
+  "planned",
+  "deprecated",
+  "experimental",
 ]);
-export type TaskClassification = z.infer<typeof TaskClassificationSchema>;
+export type IntegrationStatus = z.infer<typeof IntegrationStatusSchema>;
 
-export const TaskClassificationResultSchema = z.object({
-  classification: TaskClassificationSchema,
-  confidence: z.number().min(0).max(1),
-  reasoning: z.string(),
-  signals: z.array(z.string()).default([]),
-  requiresDesignWorkflow: z.boolean(),
+export const IntegrationMetadataSchema = z.object({
+  source: z.object({
+    name: z.string().min(1),
+    upstream_url: z.string().url(),
+    repository_url: z.string().url(),
+    subdirectory: z.string().optional(),
+    author: z.string(),
+    license: z.string(),
+    version: z.string(),
+    pinned_ref: z.string(),
+  }),
+  import: z.object({
+    date: z.union([z.string(), z.number()]),
+    imported_by: z.string(),
+    purpose: z.string(),
+  }),
+  attribution: z.object({
+    required: z.boolean(),
+    notice: z.string(),
+  }),
+  classification: z
+    .object({
+      status: IntegrationStatusSchema,
+      integration_type: z.string().optional(),
+      notes: z.string().optional(),
+    })
+    .optional(),
 });
-export type TaskClassificationResult = z.infer<
-  typeof TaskClassificationResultSchema
->;
+export type IntegrationMetadata = z.infer<typeof IntegrationMetadataSchema>;
 
 // ─── Design schemas ──────────────────────────────────────────────────────────
 

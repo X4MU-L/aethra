@@ -58,7 +58,11 @@ export function parseSkillFile(content: string, filePath: string): Skill | null 
 }
 
 /** Validate a skill file. */
-export function validateSkill(content: string, filePath: string): SkillValidationResult {
+export function validateSkill(
+  content: string,
+  filePath: string,
+  options?: { knownCapabilities?: string[] },
+): SkillValidationResult {
   const errors: string[] = [];
   const warnings: string[] = [];
 
@@ -78,7 +82,24 @@ export function validateSkill(content: string, filePath: string): SkillValidatio
     warnings.push('No requiredTools specified');
   }
 
+  // Check requiredTools against known capabilities when provided
+  if (options?.knownCapabilities && skill.metadata.requiredTools.length > 0) {
+    for (const tool of skill.metadata.requiredTools) {
+      if (!options.knownCapabilities.includes(tool)) {
+        warnings.push(
+          `requiredTools entry "${tool}" is not a registered capability`,
+        );
+      }
+    }
+  }
+
   return { valid: errors.length === 0, errors, warnings, skill };
+}
+
+/** Get the IDs of all registered capabilities (for skill validation). */
+export async function getKnownCapabilityNames(): Promise<string[]> {
+  const { listCapabilities } = await import('../tools/capability-registry.js');
+  return listCapabilities().map((c) => c.id);
 }
 
 /** List all skills from a directory. */

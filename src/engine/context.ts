@@ -15,6 +15,7 @@ import { pathExists } from "./fs.js";
 import { listSkillsFromDir } from "../skills/manager.js";
 import type {
   PlatformType,
+  WorkflowStage,
   TaskClassificationResult,
 } from "../core/schemas.js";
 
@@ -40,7 +41,7 @@ export interface ContextSelectionResult {
 export async function selectSkillsForTask(
   taskDescription: string,
   platform: PlatformType | undefined,
-  workflowStage: "investigate" | "plan" | "implement" | "verify",
+  workflowStage: WorkflowStage,
   clientSkillsDir?: string,
 ): Promise<ContextSelectionResult> {
   // Collect all available skills
@@ -212,7 +213,7 @@ export async function selectSkillsForTask(
 export async function selectSkillsForTaskEnhanced(
   taskDescription: string,
   platform: PlatformType | undefined,
-  workflowStage: "investigate" | "plan" | "implement" | "verify",
+  workflowStage: WorkflowStage,
   clientSkillsDir?: string,
   options?: {
     taskClassification?: TaskClassificationResult;

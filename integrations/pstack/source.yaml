@@ -15,7 +15,7 @@ source:
   pinned_ref: "main (tag v0.15.15 — pin to commit SHA before production use)"
 
 import:
-  date: 2026-10-10
+  date: "2026-10-10"
   imported_by: Aethra Workbench (automated inventory)
   purpose: >
     Selectively adopt engineering principles and investigation practices that
@@ -30,16 +30,16 @@ attribution:
     Original source: https://github.com/cursor/plugins/tree/main/pstack
 
 dependencies:
-  cursor_plugin_manifest: false    # plugin.json not used
-  cursor_model_routing: false      # setup-pstack not used
-  cursor_automations: false        # Benny not used
-  cursor_subagent_dispatch: false  # agents/ not used
+  cursor_plugin_manifest: false # plugin.json not used
+  cursor_model_routing: false # setup-pstack not used
+  cursor_automations: false # Benny not used
+  cursor_subagent_dispatch: false # agents/ not used
   slack_webhook: false
   tailscale: false
 
 compatibility:
   claude_code: true
-  cursor: partial    # principles work; Cursor-specific components rejected
+  cursor: partial # principles work; Cursor-specific components rejected
   other_agents: true # all adopted content is model-agnostic plain markdown
 
 classifications:
@@ -96,7 +96,7 @@ classifications:
     - recall
     - create-verification-skill
     - maintain-verification-skill
-    - docs/guide  # Good reading for Aethra skill authors
+    - docs/guide # Good reading for Aethra skill authors
 
   # Reject: Cursor-specific, incompatible, or out of scope
   rejected:
