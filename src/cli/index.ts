@@ -41,6 +41,8 @@ async function loadCommands(): Promise<void> {
     { registerMcpCommand },
     { registerTaskCommand },
     { registerInvestigateCommand },
+    { registerFeedbackCommand },
+    { registerDesignCommand },
   ] = await Promise.all([
     import('./commands/init.js'),
     import('./commands/doctor.js'),
@@ -57,6 +59,8 @@ async function loadCommands(): Promise<void> {
     import('./commands/mcp.js'),
     import('./commands/task.js'),
     import('./commands/investigate.js'),
+    import('./commands/feedback.js'),
+    import('./commands/design.js'),
   ]);
 
   registerInitCommand(program);
@@ -74,6 +78,8 @@ async function loadCommands(): Promise<void> {
   registerMcpCommand(program);
   registerTaskCommand(program);
   registerInvestigateCommand(program);
+  registerFeedbackCommand(program);
+  registerDesignCommand(program);
 }
 
 async function main(): Promise<void> {

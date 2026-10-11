@@ -1,0 +1,546 @@
+/**
+ * `aethra feedback` — visual feedback lifecycle management.
+ * Import, triage, plan, and resolve visual feedback from providers.
+ */
+
+import type { Command } from "commander";
+import chalk from "chalk";
+import { resolveClientWorkspace } from "../../config/manager.js";
+import {
+  listFeedback,
+  loadFeedback,
+  importFeedback,
+  linkFeedbackToTask,
+  resolveFeedback,
+  createPlanFromFeedback,
+  getAllProviderStatus,
+} from "../../visual-feedback/manager.js";
+import { logger } from "../../core/logger.js";
+import { toAethraError } from "../../core/errors.js";
+
+const STATUS_ICON: Record<string, string> = {
+  pending: chalk.yellow("?"),
+  triaged: chalk.cyan("~"),
+  linked: chalk.blue(">"),
+  "in-progress": chalk.yellow(">"),
+  resolved: chalk.green("\u2713"),
+  dismissed: chalk.red("\u2717"),
+};
+
+export function registerFeedbackCommand(program: Command): void {
+  const feedback = program
+    .command("feedback")
+    .description("Visual feedback lifecycle management");
+
+  // -- feedback status -------------------------------------------------------
+  feedback
+    .command("status")
+    .description("Show provider availability and pending feedback count")
+    .option("--client <slug>", "Specify client by slug")
+    .action(async (opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+
+      try {
+        const { config, workspacePath } =
+          await resolveClientWorkspace(clientSlug);
+        const providers = await getAllProviderStatus();
+        const pending = await listFeedback(workspacePath, {
+          status: "pending",
+        });
+
+        console.log(chalk.bold.blue(`\n  Feedback Status — ${config.name}\n`));
+
+        console.log(chalk.bold("  Providers:\n"));
+        for (const p of providers) {
+          const icon = p.status.available
+            ? chalk.green("\u2713")
+            : chalk.red("\u2717");
+          const connLabel = p.status.connected
+            ? chalk.green("connected")
+            : chalk.gray("disconnected");
+          console.log(`  ${icon}  ${chalk.bold(p.name)}  ${connLabel}`);
+          if (p.status.version) {
+            console.log(chalk.gray(`        Version: ${p.status.version}`));
+          }
+          if (p.status.error) {
+            console.log(chalk.red(`        Error: ${p.status.error}`));
+          }
+        }
+
+        console.log();
+        console.log(
+          `  Pending feedback: ${chalk.bold.yellow(String(pending.length))}`,
+        );
+        console.log(
+          chalk.gray(
+            `  Default provider: ${config.visualFeedback?.defaultProvider ?? "manual"}`,
+          ),
+        );
+        console.log();
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`feedback status failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  // -- feedback import -------------------------------------------------------
+  feedback
+    .command("import")
+    .description("Import pending annotations from a provider")
+    .option("--provider <name>", "Provider to import from")
+    .option("--client <slug>", "Specify client by slug")
+    .action(async (opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+
+      try {
+        const { config, workspacePath, slug } =
+          await resolveClientWorkspace(clientSlug);
+        const providerName: string =
+          opts.provider ?? config.visualFeedback?.defaultProvider ?? "manual";
+
+        console.log(chalk.bold.blue(`\n  Import Feedback — ${config.name}\n`));
+        console.log(chalk.gray(`  Provider: ${providerName}\n`));
+
+        const result = await importFeedback(workspacePath, slug, providerName);
+
+        if (result.imported.length === 0) {
+          console.log(chalk.gray("  No new feedback to import.\n"));
+        } else {
+          console.log(
+            chalk.green(
+              `  ${chalk.bold(String(result.imported.length))} item(s) imported:\n`,
+            ),
+          );
+          for (const item of result.imported) {
+            console.log(
+              `  ${STATUS_ICON[item.status] ?? "?"}  ${chalk.bold(item.id.slice(0, 8))}  ${item.comment.slice(0, 60)}`,
+            );
+          }
+          console.log();
+        }
+
+        if (result.errors.length > 0) {
+          console.log(chalk.red(`  ${result.errors.length} error(s):\n`));
+          for (const err of result.errors) {
+            console.log(chalk.red(`    - ${err}`));
+          }
+          console.log();
+        }
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`feedback import failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  // -- feedback list ---------------------------------------------------------
+  feedback
+    .command("list")
+    .alias("ls")
+    .description("List feedback items")
+    .option(
+      "--status <status>",
+      "Filter by status (pending, triaged, linked, resolved, dismissed)",
+    )
+    .option("--page <url>", "Filter by page URL")
+    .option("--client <slug>", "Specify client by slug")
+    .option("--json", "Output as JSON")
+    .action(async (opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+      const jsonMode = opts.json || cmd.parent?.parent?.opts()?.json;
+
+      try {
+        const { config, workspacePath } =
+          await resolveClientWorkspace(clientSlug);
+        const items = await listFeedback(workspacePath, {
+          status: opts.status,
+          pageUrl: opts.page,
+        });
+
+        if (jsonMode) {
+          console.log(JSON.stringify(items, null, 2));
+          return;
+        }
+
+        console.log(chalk.bold.blue(`\n  Feedback — ${config.name}\n`));
+
+        if (items.length === 0) {
+          const hint = opts.status
+            ? `No feedback with status "${opts.status}".`
+            : "No feedback items yet. Run: aethra feedback import";
+          console.log(chalk.gray(`  ${hint}\n`));
+          return;
+        }
+
+        for (const item of items) {
+          const icon = STATUS_ICON[item.status] ?? chalk.gray("?");
+          const kindLabel = chalk.gray(`[${item.kind}/${item.severity}]`);
+          console.log(
+            `  ${icon}  ${chalk.bold(item.id.slice(0, 8))}  ${kindLabel}  ${item.comment.slice(0, 60)}`,
+          );
+          console.log(chalk.gray(`        Page: ${item.pageUrl}`));
+          if (item.taskId) {
+            console.log(chalk.gray(`        Task: ${item.taskId.slice(0, 8)}`));
+          }
+          console.log();
+        }
+
+        const statusCounts = items.reduce<Record<string, number>>(
+          (acc, item) => {
+            acc[item.status] = (acc[item.status] ?? 0) + 1;
+            return acc;
+          },
+          {},
+        );
+        const summary = Object.entries(statusCounts)
+          .map(([s, n]) => `${n} ${s}`)
+          .join(", ");
+        console.log(
+          chalk.gray(`  Total: ${items.length} item(s) — ${summary}\n`),
+        );
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`feedback list failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  // -- feedback show ---------------------------------------------------------
+  feedback
+    .command("show <id>")
+    .description("Show detailed feedback item")
+    .option("--client <slug>", "Specify client by slug")
+    .option("--json", "Output as JSON")
+    .action(async (id: string, opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+      const jsonMode = opts.json || cmd.parent?.parent?.opts()?.json;
+
+      try {
+        const { workspacePath } = await resolveClientWorkspace(clientSlug);
+        const item = await loadFeedback(workspacePath, id);
+
+        if (!item) {
+          logger.error(`Feedback not found: ${id}`);
+          process.exit(1);
+        }
+
+        if (jsonMode) {
+          console.log(JSON.stringify(item, null, 2));
+          return;
+        }
+
+        const icon = STATUS_ICON[item.status] ?? "?";
+        console.log(chalk.bold.blue(`\n  Feedback ${item.id.slice(0, 8)}\n`));
+        console.log(`  ${icon}  ${chalk.bold(item.comment)}`);
+        console.log();
+        console.log(`  Status:     ${item.status}`);
+        console.log(`  ID:         ${item.id}`);
+        console.log(`  Kind:       ${item.kind}`);
+        console.log(`  Severity:   ${item.severity}`);
+        console.log(`  Intent:     ${item.intent}`);
+        console.log(`  Provider:   ${item.provider}`);
+        console.log(`  Page:       ${item.pageUrl}`);
+        console.log(`  Created:    ${item.createdAt}`);
+
+        if (item.viewport) {
+          console.log(
+            `  Viewport:   ${item.viewport.width}x${item.viewport.height}`,
+          );
+        }
+
+        // Element context
+        if (item.elementTag || item.elementSelector || item.boundingBox) {
+          console.log(chalk.bold("\n  Element context:\n"));
+          if (item.elementTag) console.log(`  Tag:        ${item.elementTag}`);
+          if (item.elementSelector)
+            console.log(`  Selector:   ${item.elementSelector}`);
+          if (item.cssClasses && item.cssClasses.length > 0) {
+            console.log(`  Classes:    ${item.cssClasses.join(", ")}`);
+          }
+          if (item.boundingBox) {
+            const bb = item.boundingBox;
+            console.log(
+              `  Bounding:   x=${bb.x} y=${bb.y} w=${bb.width} h=${bb.height}`,
+            );
+          }
+        }
+
+        // Code context
+        if (
+          item.sourceFile ||
+          (item.componentTree && item.componentTree.length > 0)
+        ) {
+          console.log(chalk.bold("\n  Code context:\n"));
+          if (item.sourceFile) console.log(`  Source:     ${item.sourceFile}`);
+          if (item.componentTree && item.componentTree.length > 0) {
+            console.log(`  Components: ${item.componentTree.join(" > ")}`);
+          }
+        }
+
+        // Accessibility
+        if (item.accessibilityContext) {
+          const ac = item.accessibilityContext;
+          console.log(chalk.bold("\n  Accessibility:\n"));
+          if (ac.role) console.log(`  Role:       ${ac.role}`);
+          if (ac.ariaLabel) console.log(`  Aria label: ${ac.ariaLabel}`);
+          if (ac.contrast != null) console.log(`  Contrast:   ${ac.contrast}`);
+          if (ac.violations && ac.violations.length > 0) {
+            for (const v of ac.violations) {
+              console.log(chalk.red(`  Violation:  ${v}`));
+            }
+          }
+        }
+
+        // Evidence
+        if (item.screenshotReference) {
+          console.log(chalk.bold("\n  Evidence:\n"));
+          console.log(`  Screenshot: ${item.screenshotReference}`);
+        }
+
+        // Resolution
+        if (item.resolutionSummary) {
+          console.log(chalk.bold("\n  Resolution:\n"));
+          console.log(`  ${item.resolutionSummary}`);
+        }
+
+        // Cross-references
+        if (item.taskId) console.log(`\n  Task:       ${item.taskId}`);
+        if (item.relatedFindingIds.length > 0) {
+          console.log(`  Findings:   ${item.relatedFindingIds.join(", ")}`);
+        }
+        if (item.relatedFeedbackIds.length > 0) {
+          console.log(`  Related:    ${item.relatedFeedbackIds.join(", ")}`);
+        }
+
+        console.log();
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`feedback show failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  // -- feedback plan ---------------------------------------------------------
+  feedback
+    .command("plan [ids...]")
+    .description("Create an implementation plan from feedback items")
+    .option("--pending", "Use all pending feedback items")
+    .option("--client <slug>", "Specify client by slug")
+    .action(async (ids: string[], opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+
+      try {
+        const { config, workspacePath, slug } =
+          await resolveClientWorkspace(clientSlug);
+
+        let items;
+        if (opts.pending) {
+          items = await listFeedback(workspacePath, { status: "pending" });
+        } else if (ids.length > 0) {
+          const loaded = await Promise.all(
+            ids.map((id) => loadFeedback(workspacePath, id)),
+          );
+          const missing = ids.filter((_, i) => !loaded[i]);
+          if (missing.length > 0) {
+            logger.error(`Feedback not found: ${missing.join(", ")}`);
+            process.exit(1);
+          }
+          items = loaded.filter(
+            (item): item is NonNullable<typeof item> => item !== null,
+          );
+        } else {
+          logger.error(
+            "Provide feedback IDs or use --pending to select all pending items.",
+          );
+          process.exit(1);
+        }
+
+        if (items.length === 0) {
+          console.log(chalk.yellow("\n  No feedback items to plan.\n"));
+          return;
+        }
+
+        console.log(chalk.bold.blue(`\n  Creating plan — ${config.name}\n`));
+        console.log(chalk.gray(`  Feedback items: ${items.length}\n`));
+
+        const { plan, taskRecord } = await createPlanFromFeedback(
+          workspacePath,
+          items,
+          slug,
+        );
+
+        console.log(chalk.bold.green(`  \u2713 Plan created\n`));
+        console.log(`  Plan:   ${plan.id}`);
+        console.log(`  Title:  ${plan.title}`);
+        console.log(
+          `  Task:   ${taskRecord.id.slice(0, 8)} — ${taskRecord.title}`,
+        );
+        console.log(`  Status: ${plan.status}`);
+        console.log();
+        console.log(
+          chalk.gray(
+            `  Next: review the plan, then run: aethra task approve ${taskRecord.id.slice(0, 8)}\n`,
+          ),
+        );
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`feedback plan failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  // -- feedback attach -------------------------------------------------------
+  feedback
+    .command("attach <feedback-id>")
+    .description("Link feedback to an existing task")
+    .requiredOption("--task <task-id>", "Task ID to link to")
+    .option("--client <slug>", "Specify client by slug")
+    .action(async (feedbackId: string, opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+
+      try {
+        const { workspacePath } = await resolveClientWorkspace(clientSlug);
+        const updated = await linkFeedbackToTask(
+          workspacePath,
+          feedbackId,
+          opts.task,
+        );
+
+        console.log(chalk.bold.green(`\n  \u2713 Feedback linked\n`));
+        console.log(`  Feedback: ${updated.id.slice(0, 8)}`);
+        console.log(`  Task:     ${opts.task}`);
+        console.log(`  Status:   ${updated.status}`);
+        console.log();
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`feedback attach failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  // -- feedback resolve ------------------------------------------------------
+  feedback
+    .command("resolve <id>")
+    .description("Mark feedback as resolved")
+    .requiredOption("--summary <text>", "Resolution summary")
+    .option("--client <slug>", "Specify client by slug")
+    .action(async (id: string, opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+
+      try {
+        const { workspacePath } = await resolveClientWorkspace(clientSlug);
+        const updated = await resolveFeedback(workspacePath, id, opts.summary);
+
+        console.log(chalk.bold.green(`\n  \u2713 Feedback resolved\n`));
+        console.log(`  Feedback: ${updated.id.slice(0, 8)}`);
+        console.log(`  Status:   ${updated.status}`);
+        console.log(`  Summary:  ${opts.summary}`);
+        console.log();
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`feedback resolve failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  // -- feedback watch --------------------------------------------------------
+  feedback
+    .command("watch")
+    .description("Poll for new feedback at regular intervals")
+    .option("--provider <name>", "Provider to watch")
+    .option("--interval <seconds>", "Polling interval in seconds", "10")
+    .option("--client <slug>", "Specify client by slug")
+    .action(async (opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+
+      try {
+        const { config, workspacePath, slug } =
+          await resolveClientWorkspace(clientSlug);
+        const providerName: string =
+          opts.provider ?? config.visualFeedback?.defaultProvider ?? "manual";
+        const intervalMs = parseInt(opts.interval, 10) * 1000;
+
+        console.log(
+          chalk.bold.blue(`\n  Watching for feedback — ${config.name}\n`),
+        );
+        console.log(chalk.gray(`  Provider: ${providerName}`));
+        console.log(chalk.gray(`  Interval: ${opts.interval}s`));
+        console.log(chalk.gray("  Press Ctrl+C to stop.\n"));
+
+        const ora = (await import("ora")).default;
+        const spinner = ora({
+          text: "Polling for feedback...",
+          color: "cyan",
+        }).start();
+
+        let running = true;
+        let totalImported = 0;
+
+        const shutdown = (): void => {
+          running = false;
+          spinner.stop();
+          console.log(
+            chalk.gray(
+              `\n  Stopped. ${totalImported} item(s) imported total.\n`,
+            ),
+          );
+          process.exit(0);
+        };
+
+        process.on("SIGINT", shutdown);
+        process.on("SIGTERM", shutdown);
+
+        while (running) {
+          try {
+            const result = await importFeedback(
+              workspacePath,
+              slug,
+              providerName,
+            );
+
+            if (result.imported.length > 0) {
+              totalImported += result.imported.length;
+              spinner.stop();
+              console.log(
+                chalk.green(
+                  `  +${result.imported.length} new item(s) imported (total: ${totalImported})`,
+                ),
+              );
+              for (const item of result.imported) {
+                console.log(
+                  chalk.gray(
+                    `    ${item.id.slice(0, 8)}  ${item.comment.slice(0, 60)}`,
+                  ),
+                );
+              }
+              spinner.start("Polling for feedback...");
+            }
+
+            if (result.errors.length > 0) {
+              spinner.stop();
+              for (const err of result.errors) {
+                console.log(chalk.red(`  Error: ${err}`));
+              }
+              spinner.start("Polling for feedback...");
+            }
+          } catch (pollErr) {
+            spinner.stop();
+            logger.warn(`Poll error: ${(pollErr as Error).message}`);
+            spinner.start("Polling for feedback...");
+          }
+
+          // Wait for interval
+          if (running) {
+            await new Promise<void>((resolve) =>
+              setTimeout(resolve, intervalMs),
+            );
+          }
+        }
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`feedback watch failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+}
