@@ -1,10 +1,10 @@
 source:
   name: anatomy
-  upstream_url: https://github.com/X4MU-L/anatomy
-  repository_url: https://github.com/X4MU-L/anatomy
-  author: X4MU-L
-  license: TBD # verify before production use
-  version: TBD # pin to specific release tag or commit SHA
+  upstream_url: https://github.com/wheresryan22/anatomy
+  repository_url: https://github.com/wheresryan22/anatomy
+  author: wheresryan22
+  license: MIT
+  version: 1.0.0
   pinned_ref: "main" # pin to commit SHA before production use
 
 import:
@@ -13,6 +13,13 @@ import:
   purpose: >
     Provide specialized illustration capability for technical explainers,
     architecture diagrams, and visual documentation within Aethra workflows.
+
+attribution:
+  required: true
+  notice: >
+    Engineering principles in this integration are adapted from pstack by Lauren Tan (poteto),
+    licensed under MIT (https://github.com/wheresryan22/anatomy/blob/main/LICENSE).
+    Original source: https://github.com/wheresryan22/anatomy/tree/main
 
 classification:
   status: planned
