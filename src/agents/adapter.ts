@@ -3,8 +3,8 @@
  * Defines how Aethra delegates implementation work to AI agents.
  */
 
-import type { ImplementationPlan } from '../core/schemas.js';
-import type { SkillSelection } from '../engine/context.js';
+import type { ImplementationPlan } from "../core/schemas.js";
+import type { SkillSelection } from "../engine/context.js";
 
 export interface AgentContext {
   plan: ImplementationPlan;
@@ -18,7 +18,7 @@ export interface AgentContext {
 }
 
 export interface AgentResult {
-  status: 'completed' | 'partial' | 'failed' | 'not-available';
+  status: "completed" | "partial" | "failed" | "not-available";
   agentName: string;
   instructionPath: string;
   outputLog?: string;

@@ -1,0 +1,38 @@
+source:
+  name: anatomy
+  upstream_url: https://github.com/X4MU-L/anatomy
+  repository_url: https://github.com/X4MU-L/anatomy
+  author: X4MU-L
+  license: TBD # verify before production use
+  version: TBD # pin to specific release tag or commit SHA
+  pinned_ref: "main" # pin to commit SHA before production use
+
+import:
+  date: "2026-10-11"
+  imported_by: Aethra Workbench
+  purpose: >
+    Provide specialized illustration capability for technical explainers,
+    architecture diagrams, and visual documentation within Aethra workflows.
+
+classification:
+  status: planned
+  integration_type: optional-capability
+  notes: >
+    Anatomy is an optional integration. Aethra functions fully without it.
+    It is only selected when the task requires technical illustration output.
+
+dependencies:
+  runtime_required: false
+  aethra_required: true
+
+compatibility:
+  claude_code: true
+  other_agents: true
+  output_formats:
+    - html
+    - svg
+    - react-component
+
+evaluation:
+  test_cases: [] # to be populated after integration testing
+  last_evaluated: null
