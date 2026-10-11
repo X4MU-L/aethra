@@ -106,17 +106,40 @@ describe("evaluateDesign", () => {
     expect(result.createdAt).toBeTruthy();
   });
 
-  it("stub returns score 0 for manual review", async () => {
+  it("stub returns score 0 with pending review status", async () => {
     const result = await evaluateDesign({
       screenshotPaths: ["test.png"],
       taskDescription: "Test evaluation",
     });
 
     expect(result.overallScore).toBe(0);
+    expect(result.reviewStatus).toBe("pending");
     for (const score of result.scores) {
       expect(score.score).toBe(0);
-      expect(score.observation).toBe("Manual review required");
+      expect(score.observation).toContain("Not yet evaluated");
     }
+  });
+
+  it("stub includes generated critique prompt", async () => {
+    const result = await evaluateDesign({
+      screenshotPaths: ["test.png"],
+      designBrief: MOCK_BRIEF,
+      taskDescription: "Test evaluation",
+    });
+
+    expect(result.critiquePrompt).toBeTruthy();
+    expect(result.critiquePrompt).toContain("Test evaluation");
+    expect(result.critiquePrompt).toContain("visual-hierarchy");
+  });
+
+  it("stub summary indicates pending review", async () => {
+    const result = await evaluateDesign({
+      screenshotPaths: ["test.png"],
+      taskDescription: "Test evaluation",
+    });
+
+    expect(result.summary).toContain("pending");
+    expect(result.improvements).toHaveLength(0);
   });
 
   it("each score entry has dimension, score, observation, and suggestion", async () => {

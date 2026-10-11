@@ -3,35 +3,42 @@
  * Accepts either a plan JSON path OR --task <id> to look up the task's plan.
  */
 
-import type { Command } from 'commander';
-import path from 'path';
-import chalk from 'chalk';
-import crypto from 'crypto';
-import { resolveClientWorkspace } from '../../config/manager.js';
-import { runAudit } from '../../audit/runner.js';
-import { readJson, writeJson, ensureDir, pathExists } from '../../engine/fs.js';
-import { findTaskByPrefix, transitionTask } from '../../engine/tasks.js';
-import { runTestSuite, type TestRunResult } from '../../engine/testrunner.js';
-import { logger } from '../../core/logger.js';
-import { toAethraError } from '../../core/errors.js';
-import type { ImplementationPlan } from '../../core/schemas.js';
+import type { Command } from "commander";
+import path from "path";
+import chalk from "chalk";
+import crypto from "crypto";
+import { resolveClientWorkspace } from "../../config/manager.js";
+import { runAudit } from "../../audit/runner.js";
+import { readJson, writeJson, ensureDir, pathExists } from "../../engine/fs.js";
+import { findTaskByPrefix, transitionTask } from "../../engine/tasks.js";
+import { runTestSuite, type TestRunResult } from "../../engine/testrunner.js";
+import { logger } from "../../core/logger.js";
+import { toAethraError } from "../../core/errors.js";
+import type { ImplementationPlan } from "../../core/schemas.js";
 
 export function registerVerifyCommand(program: Command): void {
   program
-    .command('verify')
-    .description('Verify implementation against plan acceptance criteria')
-    .argument('[plan]', 'Plan JSON file to verify against')
-    .option('--client <slug>', 'Specify client by slug')
-    .option('--task <id>', 'Task ID to verify (looks up the plan automatically)')
-    .option('--run-tests [dir]', 'Run the test suite in this directory (or config.repositoryPath) and record pass/fail')
-    .option('--json', 'Output results as JSON')
+    .command("verify")
+    .description("Verify implementation against plan acceptance criteria")
+    .argument("[plan]", "Plan JSON file to verify against")
+    .option("--client <slug>", "Specify client by slug")
+    .option(
+      "--task <id>",
+      "Task ID to verify (looks up the plan automatically)",
+    )
+    .option(
+      "--run-tests [dir]",
+      "Run the test suite in this directory (or config.repositoryPath) and record pass/fail",
+    )
+    .option("--json", "Output results as JSON")
     .action(async (planArg: string | undefined, opts, cmd) => {
       const clientSlug = opts.client ?? cmd.parent?.opts()?.client;
 
       const jsonMode = opts.json || cmd.parent?.opts()?.json;
 
       try {
-        const { config, workspacePath } = await resolveClientWorkspace(clientSlug);
+        const { config, workspacePath } =
+          await resolveClientWorkspace(clientSlug);
 
         if (!jsonMode) {
           console.log(chalk.bold.blue(`\n  Verify — ${config.name}\n`));
@@ -43,7 +50,10 @@ export function registerVerifyCommand(program: Command): void {
 
         if (opts.task) {
           // Look up task → plan path
-          const taskRecord = await findTaskByPrefix(workspacePath, opts.task as string);
+          const taskRecord = await findTaskByPrefix(
+            workspacePath,
+            opts.task as string,
+          );
           if (!taskRecord) {
             logger.error(`Task not found: ${opts.task}`);
             process.exit(1);
@@ -52,7 +62,11 @@ export function registerVerifyCommand(program: Command): void {
           if (await pathExists(taskRecord.planPath)) {
             plan = await readJson<ImplementationPlan>(taskRecord.planPath);
             if (!jsonMode) {
-              console.log(chalk.gray(`  Task: ${taskRecord.id.slice(0, 8)} — ${taskRecord.title}`));
+              console.log(
+                chalk.gray(
+                  `  Task: ${taskRecord.id.slice(0, 8)} — ${taskRecord.title}`,
+                ),
+              );
               console.log(chalk.gray(`  Plan: ${plan.title}\n`));
             }
           }
@@ -61,14 +75,16 @@ export function registerVerifyCommand(program: Command): void {
             ? planArg
             : path.resolve(process.cwd(), planArg);
 
-          const jsonPath = planPath.endsWith('.json')
+          const jsonPath = planPath.endsWith(".json")
             ? planPath
-            : planPath.replace(/\.md$/, '.json');
+            : planPath.replace(/\.md$/, ".json");
 
           if (await pathExists(jsonPath)) {
             plan = await readJson<ImplementationPlan>(jsonPath);
             if (!jsonMode) {
-              console.log(chalk.gray(`  Verifying against plan: ${plan.title}\n`));
+              console.log(
+                chalk.gray(`  Verifying against plan: ${plan.title}\n`),
+              );
             }
           }
         }
@@ -79,7 +95,7 @@ export function registerVerifyCommand(program: Command): void {
         if (opts.runTests !== undefined) {
           // --run-tests may be a boolean (flag with no value) or a string (explicit dir)
           const testDir =
-            typeof opts.runTests === 'string'
+            typeof opts.runTests === "string"
               ? opts.runTests
               : (config.repositoryPath ?? process.cwd());
 
@@ -90,8 +106,10 @@ export function registerVerifyCommand(program: Command): void {
           testRun = await runTestSuite(testDir, { cwd: testDir });
 
           if (!jsonMode) {
-            const icon = testRun.passed ? chalk.green('✓') : chalk.red('✗');
-            console.log(`  ${icon} Tests: ${testRun.passedCount} passed, ${testRun.failedCount} failed`);
+            const icon = testRun.passed ? chalk.green("✓") : chalk.red("✗");
+            console.log(
+              `  ${icon} Tests: ${testRun.passedCount} passed, ${testRun.failedCount} failed`,
+            );
             if (testRun.parseError) {
               console.log(chalk.yellow(`  ⚠ ${testRun.parseError}`));
             }
@@ -100,9 +118,9 @@ export function registerVerifyCommand(program: Command): void {
         }
 
         // Run a verification audit
-        logger.info('Running verification audit...');
+        logger.info("Running verification audit...");
         const verifyAudit = await runAudit(config, workspacePath, {
-          type: 'refresh',
+          type: "refresh",
           maxPages: 5,
           runLighthouseAudit: plan !== null,
           captureScreenshots: true,
@@ -118,36 +136,48 @@ export function registerVerifyCommand(program: Command): void {
           // Guard against empty acceptance criteria (vacuous truth)
           if (plan.acceptanceCriteria.length === 0) {
             verificationResults.push({
-              criterion: 'Manual review required (no acceptance criteria defined)',
+              criterion:
+                "Manual review required (no acceptance criteria defined)",
               passed: null,
-              notes: 'Plan has no acceptance criteria. Engineer must manually verify and sign off.',
+              notes:
+                "Plan has no acceptance criteria. Engineer must manually verify and sign off.",
             });
           }
 
           for (const ac of plan.acceptanceCriteria) {
             // Auto-verify what we can from the audit and test results
             let passed: boolean | null = null;
-            let notes = 'Manual verification required';
+            let notes = "Manual verification required";
 
-            if (ac.category === 'performance' && verifyAudit.artifactManifest.some((a) => a.type === 'lighthouse')) {
+            if (
+              ac.category === "performance" &&
+              verifyAudit.artifactManifest.some((a) => a.type === "lighthouse")
+            ) {
               passed = null; // Would need baseline comparison
-              notes = 'Lighthouse report generated. Compare with baseline.';
+              notes = "Lighthouse report generated. Compare with baseline.";
             }
 
-            if (ac.category === 'visual' && verifyAudit.artifactManifest.some((a) => a.type === 'screenshot')) {
+            if (
+              ac.category === "visual" &&
+              verifyAudit.artifactManifest.some((a) => a.type === "screenshot")
+            ) {
               passed = null; // Visual comparison requires human or tool
-              notes = 'Screenshots captured. Review for visual regressions.';
+              notes = "Screenshots captured. Review for visual regressions.";
             }
 
             // Auto-verify test and behaviour criteria when test suite ran
-            if (ac.category === 'test' && testRun !== undefined) {
+            if (ac.category === "test" && testRun !== undefined) {
               passed = testRun.passed;
               notes = testRun.passed
                 ? `Test suite passed (${testRun.passedCount} passed, ${testRun.failedCount} failed)`
                 : `Test suite failed (${testRun.passedCount} passed, ${testRun.failedCount} failed)`;
             }
 
-            if (ac.category === 'behaviour' && testRun !== undefined && testRun.passed) {
+            if (
+              ac.category === "behaviour" &&
+              testRun !== undefined &&
+              testRun.passed
+            ) {
               passed = true;
               notes = `Automated tests passed — behaviour verified (${testRun.passedCount} tests)`;
             }
@@ -158,12 +188,63 @@ export function registerVerifyCommand(program: Command): void {
               notes,
             });
           }
+
+          // Design critique check for design-exploration tasks
+          if (plan.taskDescription && resolvedTaskId) {
+            const hasVisualCriteria = plan.acceptanceCriteria.some(
+              (ac) => ac.category === "visual",
+            );
+            if (hasVisualCriteria) {
+              try {
+                const { classifyTask } =
+                  await import("../../design/task-classifier.js");
+                const classification = classifyTask(plan.taskDescription);
+                if (classification.classification === "design-exploration") {
+                  const { loadCritique } =
+                    await import("../../design/critic.js");
+                  const critique = await loadCritique(
+                    workspacePath,
+                    resolvedTaskId,
+                  );
+                  if (!critique) {
+                    verificationResults.push({
+                      criterion: "Design critique review",
+                      passed: null,
+                      notes:
+                        "No design critique found. Consider running 'aethra design critique' for visual evaluation.",
+                    });
+                  } else if (critique.reviewStatus === "pending") {
+                    verificationResults.push({
+                      criterion: "Design critique review",
+                      passed: null,
+                      notes:
+                        "Design critique pending review. Run the generated prompt through a visual model or review manually.",
+                    });
+                  } else if (critique.overallScore < 5) {
+                    verificationResults.push({
+                      criterion: "Design critique review",
+                      passed: false,
+                      notes: `Design critique score ${critique.overallScore}/10 is below threshold (5). Review improvements.`,
+                    });
+                  } else {
+                    verificationResults.push({
+                      criterion: "Design critique review",
+                      passed: true,
+                      notes: `Design critique passed with score ${critique.overallScore}/10.`,
+                    });
+                  }
+                }
+              } catch {
+                // Design classification/critique is supplementary — don't fail verify
+              }
+            }
+          }
         }
 
         // Save verification record
-        const verifyDir = path.join(workspacePath, 'evidence', 'browser-tests');
+        const verifyDir = path.join(workspacePath, "evidence", "browser-tests");
         await ensureDir(verifyDir);
-        const verifyId = crypto.randomBytes(8).toString('hex');
+        const verifyId = crypto.randomBytes(8).toString("hex");
         const verifyRecord = {
           id: verifyId,
           timestamp: new Date().toISOString(),
@@ -186,7 +267,10 @@ export function registerVerifyCommand(program: Command): void {
               }
             : undefined,
         };
-        const verifyRecordPath = path.join(verifyDir, `verify-${verifyId}.json`);
+        const verifyRecordPath = path.join(
+          verifyDir,
+          `verify-${verifyId}.json`,
+        );
         await writeJson(verifyRecordPath, verifyRecord);
 
         // Transition task: verifying → completed (or leave at verifying if ACs need human review)
@@ -199,19 +283,33 @@ export function registerVerifyCommand(program: Command): void {
             !testsFailed &&
             verificationResults.length > 0 &&
             verificationResults.every((r) => r.passed === true);
-          const newStatus = anyDefinitelyFailed ? 'in-progress' : allPassed ? 'completed' : 'verifying';
+          const newStatus = anyDefinitelyFailed
+            ? "in-progress"
+            : allPassed
+              ? "completed"
+              : "verifying";
 
           await transitionTask(workspacePath, resolvedTaskId, newStatus, {
             verificationId: verifyId,
           });
 
           if (!jsonMode) {
-            if (newStatus === 'completed') {
-              console.log(chalk.bold.green('\n  ✓ Task marked as completed.\n'));
-            } else if (newStatus === 'in-progress') {
-              console.log(chalk.bold.red('\n  ✗ Acceptance criteria failed — task moved back to in-progress.\n'));
+            if (newStatus === "completed") {
+              console.log(
+                chalk.bold.green("\n  ✓ Task marked as completed.\n"),
+              );
+            } else if (newStatus === "in-progress") {
+              console.log(
+                chalk.bold.red(
+                  "\n  ✗ Acceptance criteria failed — task moved back to in-progress.\n",
+                ),
+              );
             } else {
-              console.log(chalk.bold.yellow('\n  Verification needs manual review — task status: verifying.\n'));
+              console.log(
+                chalk.bold.yellow(
+                  "\n  Verification needs manual review — task status: verifying.\n",
+                ),
+              );
             }
           }
         }
@@ -227,31 +325,37 @@ export function registerVerifyCommand(program: Command): void {
         console.log(`  Artifacts: ${verifyAudit.artifactManifest.length}`);
 
         if (verificationResults.length > 0) {
-          console.log(chalk.bold('\n  Acceptance criteria:\n'));
+          console.log(chalk.bold("\n  Acceptance criteria:\n"));
           for (const result of verificationResults) {
             const icon =
               result.passed === true
-                ? chalk.green('✓')
+                ? chalk.green("✓")
                 : result.passed === false
-                ? chalk.red('✗')
-                : chalk.yellow('?');
+                  ? chalk.red("✗")
+                  : chalk.yellow("?");
             console.log(`  ${icon} ${result.criterion}`);
             console.log(chalk.gray(`      ${result.notes}`));
           }
         }
 
         if (testRun) {
-          console.log(chalk.bold('\n  Test suite:\n'));
-          const icon = testRun.passed ? chalk.green('✓') : chalk.red('✗');
-          console.log(`  ${icon} ${testRun.passedCount} passed, ${testRun.failedCount} failed  (exit ${testRun.exitCode})`);
+          console.log(chalk.bold("\n  Test suite:\n"));
+          const icon = testRun.passed ? chalk.green("✓") : chalk.red("✗");
+          console.log(
+            `  ${icon} ${testRun.passedCount} passed, ${testRun.failedCount} failed  (exit ${testRun.exitCode})`,
+          );
           if (!testRun.passed && testRun.files.length > 0) {
             for (const f of testRun.files) {
-              if (f.status === 'failed') {
+              if (f.status === "failed") {
                 for (const c of f.cases) {
-                  if (c.status === 'failed') {
+                  if (c.status === "failed") {
                     console.log(chalk.red(`    ✗ ${c.fullName}`));
                     if (c.failureMessages[0]) {
-                      console.log(chalk.gray(`      ${c.failureMessages[0].split('\n')[0]}`));
+                      console.log(
+                        chalk.gray(
+                          `      ${c.failureMessages[0].split("\n")[0]}`,
+                        ),
+                      );
                     }
                   }
                 }
@@ -261,11 +365,16 @@ export function registerVerifyCommand(program: Command): void {
         }
 
         if (verifyAudit.limitations.length > 0) {
-          console.log(chalk.bold('\n  Limitations:\n'));
-          for (const lim of verifyAudit.limitations) console.log(chalk.yellow(`  ⚠ ${lim}`));
+          console.log(chalk.bold("\n  Limitations:\n"));
+          for (const lim of verifyAudit.limitations)
+            console.log(chalk.yellow(`  ⚠ ${lim}`));
         }
 
-        console.log(chalk.cyan(`\n  Verification record: ${path.join(verifyDir, `verify-${verifyRecord.id}.json`)}\n`));
+        console.log(
+          chalk.cyan(
+            `\n  Verification record: ${path.join(verifyDir, `verify-${verifyRecord.id}.json`)}\n`,
+          ),
+        );
       } catch (err) {
         const e = toAethraError(err);
         logger.error(`verify failed: ${e.message}`);

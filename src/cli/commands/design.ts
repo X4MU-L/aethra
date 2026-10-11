@@ -297,8 +297,26 @@ export function registerDesignCommand(program: Command): void {
           taskDescription: `Task ${taskId}`,
         });
 
+        // Set taskId for persistence and lookup
+        critique.taskId = taskId;
+
         // Save critique
         const saved = await saveCritique(workspacePath, critique);
+
+        // Show review status
+        if (critique.reviewStatus === "pending") {
+          console.log(
+            chalk.yellow(
+              "  Status: Pending review (model integration pending)\n",
+            ),
+          );
+          console.log(
+            chalk.gray(
+              "  A critique prompt has been generated. Feed it to a visual model\n" +
+                "  or review the screenshots manually against the design brief.\n",
+            ),
+          );
+        }
 
         // Print scores
         console.log(chalk.bold("  Scores:\n"));
@@ -311,7 +329,10 @@ export function registerDesignCommand(program: Command): void {
           console.log(
             `    ${score.dimension.padEnd(24)} ${bar}  ${score.score}/10`,
           );
-          if (score.observation !== "Manual review required") {
+          if (
+            score.observation !== "Not yet evaluated — pending review" &&
+            score.observation !== "Manual review required"
+          ) {
             console.log(
               chalk.gray(`    ${"".padEnd(24)} ${score.observation}`),
             );

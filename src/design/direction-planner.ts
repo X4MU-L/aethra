@@ -8,7 +8,7 @@
 import crypto from "crypto";
 import path from "path";
 import type { DesignDirection } from "../core/schemas.js";
-import { writeJson, ensureDir } from "../engine/fs.js";
+import { writeJson, readJson, ensureDir, pathExists } from "../engine/fs.js";
 
 // ─── Design axes ────────────────────────────────────────────────────────────
 
@@ -277,4 +277,19 @@ export async function saveDesignDirections(
   const fp = path.join(dir, "design-directions.json");
   await writeJson(fp, directions);
   return fp;
+}
+
+/** Load saved design directions for a task. Returns null if not found. */
+export async function loadDesignDirections(
+  workspacePath: string,
+  taskId: string,
+): Promise<DesignDirection[] | null> {
+  const fp = path.join(
+    workspacePath,
+    "tasks",
+    taskId,
+    "design-directions.json",
+  );
+  if (!(await pathExists(fp))) return null;
+  return readJson<DesignDirection[]>(fp);
 }

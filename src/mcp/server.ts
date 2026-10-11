@@ -383,6 +383,74 @@ const TOOLS: Tool[] = [
       required: ["annotationId", "message"],
     },
   },
+
+  // ─── Design intelligence tools ──────────────────────────────────────────────
+
+  {
+    name: "aethra_classify_task",
+    description:
+      "Classify a task description to determine if it requires a design workflow. " +
+      "Returns classification (direct-fix, design-exploration, technical-illustration, " +
+      "conventional-engineering), confidence score, and reasoning.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        taskDescription: {
+          type: "string",
+          description: "The task description to classify",
+        },
+      },
+      required: ["taskDescription"],
+    },
+  },
+  {
+    name: "aethra_get_design_directions",
+    description:
+      "Get saved design directions for a task. Returns the array of design " +
+      "directions with axes, positions, and rationale.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        taskId: {
+          type: "string",
+          description: "Task ID to load directions for",
+        },
+      },
+      required: ["taskId"],
+    },
+  },
+  {
+    name: "aethra_get_design_brief",
+    description:
+      "Get the design brief for a task. Returns aesthetic, composition, " +
+      "hierarchy, typography, colors, anti-patterns, and responsive behavior.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        taskId: {
+          type: "string",
+          description: "Task ID to load the brief for",
+        },
+      },
+      required: ["taskId"],
+    },
+  },
+  {
+    name: "aethra_get_design_critique",
+    description:
+      "Get the latest design critique for a task. Returns scores across 10 " +
+      "dimensions, overall score, strengths, improvements, and review status.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        taskId: {
+          type: "string",
+          description: "Task ID to load critique for",
+        },
+      },
+      required: ["taskId"],
+    },
+  },
 ];
 
 // ─── Tool handlers ────────────────────────────────────────────────────────────
@@ -464,6 +532,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           toolArgs["annotationId"] as string,
           toolArgs["message"] as string,
         );
+
+      case "aethra_classify_task":
+        return await handleClassifyTask(toolArgs["taskDescription"] as string);
+
+      case "aethra_get_design_directions":
+        return await handleGetDesignDirections(toolArgs["taskId"] as string);
+
+      case "aethra_get_design_brief":
+        return await handleGetDesignBrief(toolArgs["taskId"] as string);
+
+      case "aethra_get_design_critique":
+        return await handleGetDesignCritique(toolArgs["taskId"] as string);
 
       default:
         return {
@@ -1190,6 +1270,68 @@ async function handleReplyAnnotation(annotationId: string, message: string) {
       `Failed to reply to annotation: ${(err as Error).message}`,
     );
   }
+}
+
+// ─── Design intelligence handlers ────────────────────────────────────────────
+
+async function handleClassifyTask(taskDescription: string) {
+  if (!taskDescription) return errorResult("taskDescription is required");
+
+  const { classifyTask } = await import("../design/task-classifier.js");
+  const result = classifyTask(taskDescription);
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+  };
+}
+
+async function handleGetDesignDirections(taskId: string) {
+  if (!taskId) return errorResult("taskId is required");
+
+  const { loadDesignDirections } =
+    await import("../design/direction-planner.js");
+  const directions = await loadDesignDirections(workspacePath, taskId);
+  if (!directions) {
+    return errorResult(
+      `No design directions found for task ${taskId}. Run 'aethra design directions' first.`,
+    );
+  }
+  return {
+    content: [
+      { type: "text" as const, text: JSON.stringify(directions, null, 2) },
+    ],
+  };
+}
+
+async function handleGetDesignBrief(taskId: string) {
+  if (!taskId) return errorResult("taskId is required");
+
+  const { loadDesignBrief } = await import("../design/design-brief.js");
+  const brief = await loadDesignBrief(workspacePath, taskId);
+  if (!brief) {
+    return errorResult(
+      `No design brief found for task ${taskId}. Run 'aethra design brief' first.`,
+    );
+  }
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(brief, null, 2) }],
+  };
+}
+
+async function handleGetDesignCritique(taskId: string) {
+  if (!taskId) return errorResult("taskId is required");
+
+  const { loadCritique } = await import("../design/critic.js");
+  const critique = await loadCritique(workspacePath, taskId);
+  if (!critique) {
+    return errorResult(
+      `No design critique found for task ${taskId}. Run 'aethra design critique' first.`,
+    );
+  }
+  return {
+    content: [
+      { type: "text" as const, text: JSON.stringify(critique, null, 2) },
+    ],
+  };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

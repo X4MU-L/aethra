@@ -9,8 +9,9 @@
 
 import crypto from "crypto";
 import path from "path";
+import { glob } from "glob";
 import type { CritiqueResult, DesignBrief } from "../core/schemas.js";
-import { writeJson, ensureDir } from "../engine/fs.js";
+import { writeJson, readJson, ensureDir, pathExists } from "../engine/fs.js";
 import { logger } from "../core/logger.js";
 
 const CRITIQUE_DIMENSIONS = [
@@ -83,10 +84,16 @@ export async function evaluateDesign(input: {
   designBrief?: DesignBrief;
   taskDescription: string;
 }): Promise<CritiqueResult> {
-  // Stub implementation -- returns manual review placeholder
-  // Ready for model integration when a multimodal evaluation provider is available
+  // Stub: generates the evaluation prompt but does not call a model.
+  // Returns reviewStatus: "pending" so consumers know this is unevaluated.
   logger.info(
     "Design critique: manual visual review required (model integration pending)",
+  );
+
+  const prompt = createCritiquePrompt(
+    input.screenshotPaths,
+    input.designBrief ?? null,
+    input.taskDescription,
   );
 
   const now = new Date().toISOString();
@@ -98,17 +105,17 @@ export async function evaluateDesign(input: {
     scores: CRITIQUE_DIMENSIONS.map((dim) => ({
       dimension: dim,
       score: 0,
-      observation: "Manual review required",
-      suggestion: "Evaluate this dimension during human design review",
+      observation: "Not yet evaluated — pending review",
+      suggestion: "Evaluate this dimension during design review",
     })),
     overallScore: 0,
     summary:
-      "Automated visual critique requires model integration. Please perform manual design review.",
+      "Design critique pending review. Prompt generated for external model evaluation.",
     strengths: [],
-    improvements: [
-      "Connect a multimodal model for automated visual evaluation",
-    ],
+    improvements: [],
     accessibilityNotes: [],
+    reviewStatus: "pending",
+    critiquePrompt: prompt,
     createdAt: now,
   };
 }
@@ -123,4 +130,24 @@ export async function saveCritique(
   await writeJson(fp, critique);
   logger.debug(`Critique saved: ${fp}`);
   return fp;
+}
+
+/** Load the latest critique for a task. Returns null if none found. */
+export async function loadCritique(
+  workspacePath: string,
+  taskId: string,
+): Promise<CritiqueResult | null> {
+  const dir = path.join(workspacePath, "evidence", "design-critiques");
+  if (!(await pathExists(dir))) return null;
+
+  const files = await glob("critique-*.json", { cwd: dir });
+  for (const file of files) {
+    try {
+      const critique = await readJson<CritiqueResult>(path.join(dir, file));
+      if (critique.taskId === taskId) return critique;
+    } catch {
+      // Skip malformed files
+    }
+  }
+  return null;
 }

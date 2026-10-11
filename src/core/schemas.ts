@@ -589,6 +589,9 @@ export const CritiqueScoreSchema = z.object({
 });
 export type CritiqueScore = z.infer<typeof CritiqueScoreSchema>;
 
+export const CritiqueReviewStatusSchema = z.enum(["pending", "completed"]);
+export type CritiqueReviewStatus = z.infer<typeof CritiqueReviewStatusSchema>;
+
 export const CritiqueResultSchema = z.object({
   id: z.string(),
   taskId: z.string().optional(),
@@ -600,6 +603,8 @@ export const CritiqueResultSchema = z.object({
   strengths: z.array(z.string()).default([]),
   improvements: z.array(z.string()).default([]),
   accessibilityNotes: z.array(z.string()).default([]),
+  reviewStatus: CritiqueReviewStatusSchema.default("completed"),
+  critiquePrompt: z.string().optional(),
   createdAt: IsoTimestampSchema,
 });
 export type CritiqueResult = z.infer<typeof CritiqueResultSchema>;
