@@ -14,6 +14,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
+  SubscribeRequestSchema,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import path from "path";
@@ -25,12 +28,26 @@ import type {
   ImplementationPlan,
   AuditRun,
 } from "../core/schemas.js";
+import {
+  getDb,
+  dbListTasks,
+  dbLoadTask,
+  dbFindTaskByPrefix,
+  dbListFeedback,
+  dbLoadFeedback,
+  dbListPlans,
+} from "../engine/db.js";
 
 // ─── Server setup ─────────────────────────────────────────────────────────────
 
 const server = new Server(
   { name: "aethra", version: "0.1.0" },
-  { capabilities: { tools: {} } },
+  {
+    capabilities: {
+      tools: {},
+      resources: { subscribe: true, listChanged: true },
+    },
+  },
 );
 
 // Workspace path — resolved from CLI arg or environment
@@ -247,6 +264,98 @@ const TOOLS: Tool[] = [
       required: ["feedbackId"],
     },
   },
+  // ─── Agentation proxy tools (live annotations from toolbar) ────────────
+  {
+    name: "aethra_get_pending_annotations",
+    description:
+      "Get pending visual annotations from the Agentation toolbar. " +
+      "Returns unacknowledged annotations with element selectors, comments, " +
+      "severity, and UI context. Requires the Agentation server to be running.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "aethra_watch_annotations",
+    description:
+      "Block until new annotations arrive from the Agentation toolbar, then return them. " +
+      "Collects annotations over a window (default 10s, max 60s) and returns the batch. " +
+      "Use this for hands-free feedback processing loops.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        timeoutSeconds: {
+          type: "number",
+          description:
+            "How long to wait for annotations (default: 10, max: 60)",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "aethra_resolve_annotation",
+    description:
+      "Mark an Agentation annotation as resolved. Call this after you have " +
+      "implemented and verified the fix for the annotated issue.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        annotationId: {
+          type: "string",
+          description: "The annotation ID to resolve",
+        },
+        summary: {
+          type: "string",
+          description:
+            "Brief description of what was done to resolve the issue",
+        },
+      },
+      required: ["annotationId"],
+    },
+  },
+  {
+    name: "aethra_dismiss_annotation",
+    description:
+      "Dismiss an Agentation annotation with a reason. Use when the annotation " +
+      "is not actionable, out of scope, or already addressed.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        annotationId: {
+          type: "string",
+          description: "The annotation ID to dismiss",
+        },
+        reason: {
+          type: "string",
+          description: "Why this annotation is being dismissed",
+        },
+      },
+      required: ["annotationId", "reason"],
+    },
+  },
+  {
+    name: "aethra_reply_annotation",
+    description:
+      "Reply to an Agentation annotation with a message. Use to ask for " +
+      "clarification, provide status updates, or communicate with the reviewer.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        annotationId: {
+          type: "string",
+          description: "The annotation ID to reply to",
+        },
+        message: {
+          type: "string",
+          description: "The reply message",
+        },
+      },
+      required: ["annotationId", "message"],
+    },
+  },
 ];
 
 // ─── Tool handlers ────────────────────────────────────────────────────────────
@@ -301,6 +410,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "aethra_get_feedback":
         return await handleGetFeedback(toolArgs["feedbackId"] as string);
+
+      // Agentation proxy tools
+      case "aethra_get_pending_annotations":
+        return await handleGetPendingAnnotations();
+
+      case "aethra_watch_annotations":
+        return await handleWatchAnnotations(
+          toolArgs["timeoutSeconds"] as number | undefined,
+        );
+
+      case "aethra_resolve_annotation":
+        return await handleResolveAnnotation(
+          toolArgs["annotationId"] as string,
+          toolArgs["summary"] as string | undefined,
+        );
+
+      case "aethra_dismiss_annotation":
+        return await handleDismissAnnotation(
+          toolArgs["annotationId"] as string,
+          toolArgs["reason"] as string,
+        );
+
+      case "aethra_reply_annotation":
+        return await handleReplyAnnotation(
+          toolArgs["annotationId"] as string,
+          toolArgs["message"] as string,
+        );
 
       default:
         return {
@@ -416,49 +552,67 @@ async function handleGetLatestAudit(type: string = "baseline") {
 }
 
 async function handleListPlans(status?: string) {
-  const plansDir = path.join(workspacePath, "plans");
-  if (!(await fs.pathExists(plansDir))) {
+  try {
+    const db = getDb(workspacePath);
+    const plans = dbListPlans(db, status ? { status } : undefined).map((p) => ({
+      id: p.id,
+      title: p.title,
+      status: p.status,
+      createdAt: p.createdAt,
+      file: p.filePath,
+    }));
     return {
-      content: [{ type: "text" as const, text: JSON.stringify({ plans: [] }) }],
+      content: [
+        { type: "text" as const, text: JSON.stringify({ plans }, null, 2) },
+      ],
+    };
+  } catch {
+    // Fallback to filesystem for workspaces not yet migrated
+    const plansDir = path.join(workspacePath, "plans");
+    if (!(await fs.pathExists(plansDir))) {
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify({ plans: [] }) },
+        ],
+      };
+    }
+
+    const files = await fs.readdir(plansDir);
+    const planFiles = files.filter((f) => f.endsWith(".json"));
+    const plans: Array<{
+      id: string;
+      title: string;
+      status: string;
+      createdAt: string;
+      file: string;
+    }> = [];
+
+    for (const file of planFiles) {
+      try {
+        const plan = (await fs.readJson(
+          path.join(plansDir, file),
+        )) as ImplementationPlan;
+        if (!status || plan.status === status) {
+          plans.push({
+            id: plan.id,
+            title: plan.title,
+            status: plan.status,
+            createdAt: plan.createdAt,
+            file,
+          });
+        }
+      } catch {
+        /* skip */
+      }
+    }
+
+    plans.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return {
+      content: [
+        { type: "text" as const, text: JSON.stringify({ plans }, null, 2) },
+      ],
     };
   }
-
-  const files = await fs.readdir(plansDir);
-  const planFiles = files.filter((f) => f.endsWith(".json"));
-
-  const plans: Array<{
-    id: string;
-    title: string;
-    status: string;
-    createdAt: string;
-    file: string;
-  }> = [];
-
-  for (const file of planFiles) {
-    try {
-      const plan = (await fs.readJson(
-        path.join(plansDir, file),
-      )) as ImplementationPlan;
-      if (!status || plan.status === status) {
-        plans.push({
-          id: plan.id,
-          title: plan.title,
-          status: plan.status,
-          createdAt: plan.createdAt,
-          file,
-        });
-      }
-    } catch {
-      // Skip malformed plan files
-    }
-  }
-
-  plans.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  return {
-    content: [
-      { type: "text" as const, text: JSON.stringify({ plans }, null, 2) },
-    ],
-  };
 }
 
 async function handleGetPlan(planId: string) {
@@ -572,75 +726,39 @@ async function handleGetKnowledge(filename: string) {
 }
 
 async function handleListTasks(status?: string) {
-  const tasksRoot = path.join(workspacePath, "tasks");
-  if (!(await fs.pathExists(tasksRoot))) {
+  try {
+    const db = getDb(workspacePath);
+    const tasks = dbListTasks(db, status ? { status } : undefined).map((t) => ({
+      id: t.id,
+      title: t.title,
+      status: t.status,
+      planId: t.planId,
+      createdAt: t.createdAt,
+      updatedAt: t.updatedAt,
+    }));
+    return {
+      content: [
+        { type: "text" as const, text: JSON.stringify({ tasks }, null, 2) },
+      ],
+    };
+  } catch {
     return {
       content: [{ type: "text" as const, text: JSON.stringify({ tasks: [] }) }],
     };
   }
-
-  const entries = await fs.readdir(tasksRoot);
-  const tasks: Array<{
-    id: string;
-    title: string;
-    status: string;
-    planId: string;
-    createdAt: string;
-    updatedAt: string;
-  }> = [];
-
-  for (const entry of entries) {
-    const fp = path.join(tasksRoot, entry, "task.yaml");
-    if (!(await fs.pathExists(fp))) continue;
-    try {
-      const raw = await fs.readJson(fp);
-      if (!status || raw.status === status) {
-        tasks.push({
-          id: raw.id,
-          title: raw.title,
-          status: raw.status,
-          planId: raw.planId,
-          createdAt: raw.createdAt,
-          updatedAt: raw.updatedAt,
-        });
-      }
-    } catch {
-      // Skip malformed task files
-    }
-  }
-
-  tasks.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  return {
-    content: [
-      { type: "text" as const, text: JSON.stringify({ tasks }, null, 2) },
-    ],
-  };
 }
 
 async function handleGetTask(taskId: string) {
   if (!taskId) return errorResult("taskId is required");
 
-  const safeId = path.basename(taskId);
-  const tasksRoot = path.join(workspacePath, "tasks");
-  if (!(await fs.pathExists(tasksRoot))) {
-    return errorResult("tasks/ directory not found");
-  }
-
-  const entries = await fs.readdir(tasksRoot);
-  // Find by exact match or prefix match
-  const taskDir = entries.find((e) => e === safeId || e.startsWith(safeId));
-  if (!taskDir) {
+  const db = getDb(workspacePath);
+  const task = dbFindTaskByPrefix(db, taskId) ?? dbLoadTask(db, taskId);
+  if (!task) {
     return errorResult(
-      `Task not found: ${safeId}. Use aethra_list_tasks to see available tasks.`,
+      `Task not found: ${taskId}. Use aethra_list_tasks to see available tasks.`,
     );
   }
 
-  const fp = path.join(tasksRoot, taskDir, "task.yaml");
-  if (!(await fs.pathExists(fp))) {
-    return errorResult(`Task file not found for: ${taskDir}`);
-  }
-
-  const task = await fs.readJson(fp);
   return {
     content: [{ type: "text" as const, text: JSON.stringify(task, null, 2) }],
   };
@@ -649,77 +767,53 @@ async function handleGetTask(taskId: string) {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function handleListFeedback(status?: string, pageUrl?: string) {
-  const feedbackDir = path.join(workspacePath, "feedback", "items");
-  if (!(await fs.pathExists(feedbackDir))) {
+  try {
+    const db = getDb(workspacePath);
+    const filters: { status?: string; pageUrl?: string } = {};
+    if (status) filters.status = status;
+    if (pageUrl) filters.pageUrl = pageUrl;
+
+    const items = dbListFeedback(
+      db,
+      Object.keys(filters).length > 0 ? filters : undefined,
+    ).map((f) => ({
+      id: f.id,
+      comment: f.comment,
+      status: f.status,
+      kind: f.kind,
+      severity: f.severity,
+      pageUrl: f.pageUrl,
+      elementSelector: f.elementSelector,
+      createdAt: f.createdAt,
+    }));
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ feedback: items }, null, 2),
+        },
+      ],
+    };
+  } catch {
     return {
       content: [
         { type: "text" as const, text: JSON.stringify({ feedback: [] }) },
       ],
     };
   }
-
-  const entries = await fs.readdir(feedbackDir);
-  const items: Array<{
-    id: string;
-    comment: string;
-    status: string;
-    kind: string;
-    severity: string;
-    pageUrl: string;
-    elementSelector?: string;
-    createdAt: string;
-  }> = [];
-
-  for (const entry of entries) {
-    if (!entry.endsWith(".json")) continue;
-    try {
-      const raw = await fs.readJson(path.join(feedbackDir, entry));
-      if (status && raw.status !== status) continue;
-      if (pageUrl && raw.pageUrl !== pageUrl) continue;
-      items.push({
-        id: raw.id,
-        comment: raw.comment,
-        status: raw.status,
-        kind: raw.kind,
-        severity: raw.severity,
-        pageUrl: raw.pageUrl,
-        elementSelector: raw.elementSelector,
-        createdAt: raw.createdAt,
-      });
-    } catch {
-      // Skip malformed feedback files
-    }
-  }
-
-  items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify({ feedback: items }, null, 2),
-      },
-    ],
-  };
 }
 
 async function handleGetFeedback(feedbackId: string) {
   if (!feedbackId) return errorResult("feedbackId is required");
 
-  const safeFeedbackId = path.basename(feedbackId).replace(/\.json$/, "");
-  const fp = path.join(
-    workspacePath,
-    "feedback",
-    "items",
-    `${safeFeedbackId}.json`,
-  );
-
-  if (!(await fs.pathExists(fp))) {
+  const db = getDb(workspacePath);
+  const feedback = dbLoadFeedback(db, feedbackId);
+  if (!feedback) {
     return errorResult(
-      `Feedback not found: ${safeFeedbackId}. Use aethra_list_feedback to see available items.`,
+      `Feedback not found: ${feedbackId}. Use aethra_list_feedback to see available items.`,
     );
   }
 
-  const feedback = await fs.readJson(fp);
   return {
     content: [
       { type: "text" as const, text: JSON.stringify(feedback, null, 2) },
@@ -727,11 +821,489 @@ async function handleGetFeedback(feedbackId: string) {
   };
 }
 
+// ─── Agentation proxy handlers ───────────────────────────────────────────────
+
+const AGENTATION_PORT = 4747;
+const AGENTATION_BASE = `http://localhost:${AGENTATION_PORT}`;
+let agentationStarted = false;
+
+async function ensureAgentationServer(): Promise<boolean> {
+  if (agentationStarted) return true;
+
+  // Check if already running
+  try {
+    const res = await fetch(`${AGENTATION_BASE}/health`, {
+      signal: AbortSignal.timeout(2000),
+    });
+    if (res.ok) {
+      agentationStarted = true;
+      return true;
+    }
+  } catch {
+    // Not running, try to start
+  }
+
+  try {
+    const { startHttpServer } = await import("agentation-mcp");
+    startHttpServer(AGENTATION_PORT);
+    agentationStarted = true;
+    process.stderr.write(
+      `Agentation server started on port ${AGENTATION_PORT}\n`,
+    );
+    return true;
+  } catch (err) {
+    process.stderr.write(
+      `Could not start Agentation server: ${(err as Error).message}\n`,
+    );
+    return false;
+  }
+}
+
+async function handleGetPendingAnnotations() {
+  if (!(await ensureAgentationServer())) {
+    return errorResult(
+      "Agentation server not available. Install agentation-mcp or check configuration.",
+    );
+  }
+
+  try {
+    const sessionsRes = await fetch(`${AGENTATION_BASE}/sessions`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!sessionsRes.ok) {
+      return errorResult(`Failed to list sessions: ${sessionsRes.status}`);
+    }
+
+    const sessions = (await sessionsRes.json()) as Array<{ id: string }>;
+    const allPending: unknown[] = [];
+
+    for (const session of sessions) {
+      try {
+        const res = await fetch(
+          `${AGENTATION_BASE}/sessions/${session.id}/pending`,
+          { signal: AbortSignal.timeout(5000) },
+        );
+        if (res.ok) {
+          const annotations = await res.json();
+          if (Array.isArray(annotations)) {
+            allPending.push(
+              ...annotations.map((a: Record<string, unknown>) => ({
+                ...a,
+                sessionId: session.id,
+              })),
+            );
+          }
+        }
+      } catch {
+        // Skip failing sessions
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            { annotations: allPending, count: allPending.length },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  } catch (err) {
+    return errorResult(
+      `Failed to get pending annotations: ${(err as Error).message}`,
+    );
+  }
+}
+
+async function handleWatchAnnotations(timeoutSeconds?: number) {
+  if (!(await ensureAgentationServer())) {
+    return errorResult("Agentation server not available.");
+  }
+
+  const timeout = Math.min(Math.max(timeoutSeconds ?? 10, 1), 60);
+
+  try {
+    // Poll for new annotations over the timeout window
+    const startTime = Date.now();
+    const collected: unknown[] = [];
+    const seenIds = new Set<string>();
+
+    while (Date.now() - startTime < timeout * 1000) {
+      const sessionsRes = await fetch(`${AGENTATION_BASE}/sessions`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!sessionsRes.ok) break;
+
+      const sessions = (await sessionsRes.json()) as Array<{ id: string }>;
+
+      for (const session of sessions) {
+        try {
+          const res = await fetch(
+            `${AGENTATION_BASE}/sessions/${session.id}/pending`,
+            { signal: AbortSignal.timeout(3000) },
+          );
+          if (!res.ok) continue;
+          const annotations = (await res.json()) as Array<
+            Record<string, unknown>
+          >;
+          for (const ann of annotations) {
+            const id = String(ann.id ?? "");
+            if (id && !seenIds.has(id)) {
+              seenIds.add(id);
+              collected.push({ ...ann, sessionId: session.id });
+            }
+          }
+        } catch {
+          // Skip
+        }
+      }
+
+      if (collected.length > 0) break; // Got something, return immediately
+      await new Promise((r) => setTimeout(r, 2000)); // Poll every 2s
+    }
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              annotations: collected,
+              count: collected.length,
+              waitedSeconds: Math.round((Date.now() - startTime) / 1000),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  } catch (err) {
+    return errorResult(`Watch failed: ${(err as Error).message}`);
+  }
+}
+
+async function handleResolveAnnotation(annotationId: string, summary?: string) {
+  if (!annotationId) return errorResult("annotationId is required");
+  if (!(await ensureAgentationServer())) {
+    return errorResult("Agentation server not available.");
+  }
+
+  try {
+    const res = await fetch(`${AGENTATION_BASE}/annotations/${annotationId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        isFixed: true,
+        resolution: summary ?? "Resolved",
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!res.ok) {
+      return errorResult(
+        `Failed to resolve annotation ${annotationId}: ${res.status}`,
+      );
+    }
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Annotation ${annotationId} resolved.${summary ? ` Summary: ${summary}` : ""}`,
+        },
+      ],
+    };
+  } catch (err) {
+    return errorResult(
+      `Failed to resolve annotation: ${(err as Error).message}`,
+    );
+  }
+}
+
+async function handleDismissAnnotation(annotationId: string, reason: string) {
+  if (!annotationId) return errorResult("annotationId is required");
+  if (!(await ensureAgentationServer())) {
+    return errorResult("Agentation server not available.");
+  }
+
+  try {
+    const res = await fetch(`${AGENTATION_BASE}/annotations/${annotationId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dismissed: true, dismissReason: reason }),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!res.ok) {
+      return errorResult(
+        `Failed to dismiss annotation ${annotationId}: ${res.status}`,
+      );
+    }
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Annotation ${annotationId} dismissed. Reason: ${reason}`,
+        },
+      ],
+    };
+  } catch (err) {
+    return errorResult(
+      `Failed to dismiss annotation: ${(err as Error).message}`,
+    );
+  }
+}
+
+async function handleReplyAnnotation(annotationId: string, message: string) {
+  if (!annotationId) return errorResult("annotationId is required");
+  if (!message) return errorResult("message is required");
+  if (!(await ensureAgentationServer())) {
+    return errorResult("Agentation server not available.");
+  }
+
+  try {
+    const res = await fetch(
+      `${AGENTATION_BASE}/annotations/${annotationId}/thread`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, role: "agent" }),
+        signal: AbortSignal.timeout(5000),
+      },
+    );
+
+    if (!res.ok) {
+      return errorResult(
+        `Failed to reply to annotation ${annotationId}: ${res.status}`,
+      );
+    }
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Reply sent to annotation ${annotationId}.`,
+        },
+      ],
+    };
+  } catch (err) {
+    return errorResult(
+      `Failed to reply to annotation: ${(err as Error).message}`,
+    );
+  }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
 function errorResult(message: string) {
   return {
     content: [{ type: "text" as const, text: message }],
     isError: true,
   };
+}
+
+// ─── Resource handlers (Agentation push notifications) ───────────────────────
+
+const PENDING_ANNOTATIONS_URI = "aethra://annotations/pending";
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  resources: [
+    {
+      uri: PENDING_ANNOTATIONS_URI,
+      name: "Pending Annotations",
+      description:
+        "Live visual feedback annotations from the Agentation toolbar. " +
+        "Subscribe to this resource to be notified when new annotations arrive.",
+      mimeType: "application/json",
+    },
+  ],
+}));
+
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  const { uri } = request.params;
+
+  if (uri === PENDING_ANNOTATIONS_URI) {
+    if (!(await ensureAgentationServer())) {
+      return {
+        contents: [
+          {
+            uri,
+            mimeType: "application/json",
+            text: JSON.stringify({
+              annotations: [],
+              error: "Agentation server not available",
+            }),
+          },
+        ],
+      };
+    }
+
+    try {
+      const sessionsRes = await fetch(`${AGENTATION_BASE}/sessions`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!sessionsRes.ok) {
+        return {
+          contents: [
+            {
+              uri,
+              mimeType: "application/json",
+              text: JSON.stringify({ annotations: [] }),
+            },
+          ],
+        };
+      }
+
+      const sessions = (await sessionsRes.json()) as Array<{ id: string }>;
+      const allPending: unknown[] = [];
+
+      for (const session of sessions) {
+        try {
+          const res = await fetch(
+            `${AGENTATION_BASE}/sessions/${session.id}/pending`,
+            {
+              signal: AbortSignal.timeout(5000),
+            },
+          );
+          if (res.ok) {
+            const annotations = await res.json();
+            if (Array.isArray(annotations)) {
+              allPending.push(
+                ...annotations.map((a: Record<string, unknown>) => ({
+                  ...a,
+                  sessionId: session.id,
+                })),
+              );
+            }
+          }
+        } catch {
+          /* skip */
+        }
+      }
+
+      return {
+        contents: [
+          {
+            uri,
+            mimeType: "application/json",
+            text: JSON.stringify({
+              annotations: allPending,
+              count: allPending.length,
+            }),
+          },
+        ],
+      };
+    } catch {
+      return {
+        contents: [
+          {
+            uri,
+            mimeType: "application/json",
+            text: JSON.stringify({ annotations: [] }),
+          },
+        ],
+      };
+    }
+  }
+
+  return {
+    contents: [
+      { uri, mimeType: "text/plain", text: `Unknown resource: ${uri}` },
+    ],
+  };
+});
+
+server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+  const { uri } = request.params;
+
+  if (uri === PENDING_ANNOTATIONS_URI) {
+    // Start the Agentation SSE bridge when a client subscribes
+    await startSseBridge();
+  }
+
+  return {};
+});
+
+// ─── SSE bridge: Agentation events → MCP resource notifications ──────────────
+
+let sseBridgeActive = false;
+let sseBridgeAbort: AbortController | null = null;
+
+async function startSseBridge(): Promise<void> {
+  if (sseBridgeActive) return;
+  if (!(await ensureAgentationServer())) return;
+
+  sseBridgeActive = true;
+  sseBridgeAbort = new AbortController();
+
+  const connectSse = async () => {
+    try {
+      const res = await fetch(`${AGENTATION_BASE}/events`, {
+        headers: { Accept: "text/event-stream" },
+        signal: sseBridgeAbort!.signal,
+      });
+
+      if (!res.ok || !res.body) {
+        process.stderr.write(
+          `Agentation SSE: failed to connect (${res.status})\n`,
+        );
+        sseBridgeActive = false;
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      process.stderr.write(
+        "Agentation SSE bridge active — annotations will push to agent\n",
+      );
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const event = JSON.parse(line.slice(6));
+              if (
+                event.type === "annotation.created" ||
+                event.type === "annotation.updated"
+              ) {
+                // Notify the agent that the pending annotations resource has changed
+                await server.sendResourceUpdated({
+                  uri: PENDING_ANNOTATIONS_URI,
+                });
+              }
+            } catch {
+              // Skip malformed SSE data
+            }
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        process.stderr.write(
+          `Agentation SSE bridge disconnected: ${(err as Error).message}\n`,
+        );
+      }
+    }
+
+    sseBridgeActive = false;
+  };
+
+  // Run in background — don't await
+  connectSse();
 }
 
 // ─── Start server ─────────────────────────────────────────────────────────────

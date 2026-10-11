@@ -44,9 +44,12 @@ beforeAll(async () => {
   tmpWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), 'aethra-e2e-'));
   await fs.mkdir(path.join(tmpWorkspace, 'tasks'), { recursive: true });
   await fs.mkdir(path.join(tmpWorkspace, 'plans'), { recursive: true });
+  await fs.mkdir(path.join(tmpWorkspace, '.local'), { recursive: true });
 });
 
 afterAll(async () => {
+  const { closeDb } = await import('../../src/engine/db.js');
+  closeDb(tmpWorkspace);
   await fs.rm(tmpWorkspace, { recursive: true, force: true });
 });
 

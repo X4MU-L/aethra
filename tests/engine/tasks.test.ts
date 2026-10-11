@@ -14,26 +14,26 @@ import {
   transitionTask,
   listTasks,
   findTaskByPrefix,
-  taskFilePath,
 } from '../../src/engine/tasks.js';
-import type { TaskRecord } from '../../src/core/schemas.js';
+import { closeDb } from '../../src/engine/db.js';
 
 let tmpDir: string;
 
 beforeAll(async () => {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aethra-tasks-test-'));
-  // Create the tasks root so workspace-level calls work
-  await fs.mkdir(path.join(tmpDir, 'tasks'), { recursive: true });
+  // Create the .local directory so getDb() can create aethra.db inside it
+  await fs.mkdir(path.join(tmpDir, '.local'), { recursive: true });
 });
 
 afterAll(async () => {
+  closeDb(tmpDir);
   await fs.rm(tmpDir, { recursive: true, force: true });
 });
 
 // ─── createTask ───────────────────────────────────────────────────────────────
 
 describe('createTask', () => {
-  it('creates a task.yaml in tasks/<id>/', async () => {
+  it('creates a task persisted in the database', async () => {
     const task = await createTask(tmpDir, 'plan-abc', '/plans/plan-abc.json', 'Fix nav', 'test-co');
 
     expect(task.id).toHaveLength(16); // 8 bytes hex
@@ -43,11 +43,10 @@ describe('createTask', () => {
     expect(task.title).toBe('Fix nav');
     expect(task.clientSlug).toBe('test-co');
 
-    // File must exist on disk
-    const fp = taskFilePath(tmpDir, task.id);
-    const raw = await fs.readFile(fp, 'utf8');
-    const parsed = JSON.parse(raw) as TaskRecord;
-    expect(parsed.id).toBe(task.id);
+    // Verify persistence via loadTask
+    const loaded = await loadTask(tmpDir, task.id);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.id).toBe(task.id);
   });
 
   it('each call produces a distinct task ID', async () => {
@@ -169,27 +168,30 @@ describe('transitionTask', () => {
 describe('listTasks', () => {
   it('returns all tasks sorted newest first', async () => {
     // Create a fresh isolated workspace for list tests
-    const listDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aethra-tasks-list-'));
-    await fs.mkdir(path.join(listDir, 'tasks'));
+    const listTmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aethra-tasks-list-'));
+    await fs.mkdir(path.join(listTmpDir, '.local'), { recursive: true });
 
-    const a = await createTask(listDir, 'p1', '/p1.json', 'First task', 'co');
+    const a = await createTask(listTmpDir, 'p1', '/p1.json', 'First task', 'co');
     // Slight delay to ensure different createdAt
     await new Promise((r) => setTimeout(r, 10));
-    const b = await createTask(listDir, 'p2', '/p2.json', 'Second task', 'co');
+    const b = await createTask(listTmpDir, 'p2', '/p2.json', 'Second task', 'co');
 
-    const tasks = await listTasks(listDir);
+    const tasks = await listTasks(listTmpDir);
     expect(tasks.length).toBe(2);
     // Sorted newest-first
     expect(tasks[0]!.id).toBe(b.id);
     expect(tasks[1]!.id).toBe(a.id);
 
-    await fs.rm(listDir, { recursive: true, force: true });
+    closeDb(listTmpDir);
+    await fs.rm(listTmpDir, { recursive: true, force: true });
   });
 
-  it('returns empty array when no tasks directory exists', async () => {
+  it('returns empty array when no tasks exist', async () => {
     const emptyDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aethra-tasks-empty-'));
+    await fs.mkdir(path.join(emptyDir, '.local'), { recursive: true });
     const tasks = await listTasks(emptyDir);
     expect(tasks).toEqual([]);
+    closeDb(emptyDir);
     await fs.rm(emptyDir, { recursive: true, force: true });
   });
 });

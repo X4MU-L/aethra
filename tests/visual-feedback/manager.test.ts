@@ -4,6 +4,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'fs';
+import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
@@ -18,14 +19,17 @@ import {
 } from '../../src/visual-feedback/manager.js';
 import { VisualFeedbackSchema } from '../../src/visual-feedback/schema.js';
 import type { VisualFeedback } from '../../src/visual-feedback/schema.js';
+import { closeDb } from '../../src/engine/db.js';
 
 let tmpDir: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = mkdtempSync(path.join(os.tmpdir(), 'aethra-vf-test-'));
+  await fs.mkdir(path.join(tmpDir, '.local'), { recursive: true });
 });
 
 afterEach(() => {
+  closeDb(tmpDir);
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -100,12 +104,14 @@ describe('listFeedback', () => {
     expect(filtered[0]!.id).toBe(fb1.id);
   });
 
-  it('returns empty array when no feedback directory exists', async () => {
+  it('returns empty array when no feedback exists', async () => {
     const emptyDir = mkdtempSync(path.join(os.tmpdir(), 'aethra-vf-empty-'));
+    await fs.mkdir(path.join(emptyDir, '.local'), { recursive: true });
     try {
       const items = await listFeedback(emptyDir);
       expect(items).toEqual([]);
     } finally {
+      closeDb(emptyDir);
       rmSync(emptyDir, { recursive: true, force: true });
     }
   });

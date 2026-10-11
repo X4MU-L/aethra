@@ -5,8 +5,9 @@
 
 import path from 'path';
 import crypto from 'crypto';
-import { writeJson, readJson, pathExists, ensureDir, listDir } from '../engine/fs.js';
-import { VisualFeedbackSchema, FeedbackSessionSchema } from './schema.js';
+import { writeJson, ensureDir } from '../engine/fs.js';
+import { getDb, dbSaveFeedback, dbLoadFeedback, dbListFeedback, dbCreateSession, dbSavePlanMeta } from '../engine/db.js';
+import { FeedbackSessionSchema } from './schema.js';
 import type { VisualFeedback, FeedbackSession } from './schema.js';
 import type { Finding, ImplementationPlan, TaskRecord } from '../core/schemas.js';
 import { getProvider, listProviders } from './providers/registry.js';
@@ -16,22 +17,12 @@ import { VisualFeedbackError } from '../core/errors.js';
 
 // ─── Feedback CRUD ───────────────────────────────────────────────────────────
 
-function feedbackItemPath(workspacePath: string, id: string): string {
-  return path.join(workspacePath, 'feedback', 'items', `${id}.json`);
-}
-
-function feedbackSessionPath(workspacePath: string, id: string): string {
-  return path.join(workspacePath, 'feedback', 'sessions', `${id}.json`);
-}
-
 /** Save a feedback item to the workspace. */
 export async function saveFeedback(
   workspacePath: string,
   feedback: VisualFeedback,
 ): Promise<void> {
-  const dir = path.join(workspacePath, 'feedback', 'items');
-  await ensureDir(dir);
-  await writeJson(feedbackItemPath(workspacePath, feedback.id), feedback);
+  dbSaveFeedback(getDb(workspacePath), feedback);
   logger.debug(`Feedback saved: ${feedback.id}`);
 }
 
@@ -40,15 +31,7 @@ export async function loadFeedback(
   workspacePath: string,
   feedbackId: string,
 ): Promise<VisualFeedback | null> {
-  const fp = feedbackItemPath(workspacePath, feedbackId);
-  if (!(await pathExists(fp))) return null;
-  try {
-    const raw = await readJson<unknown>(fp);
-    return VisualFeedbackSchema.parse(raw);
-  } catch (err) {
-    logger.warn(`Could not parse feedback ${feedbackId}: ${(err as Error).message}`);
-    return null;
-  }
+  return dbLoadFeedback(getDb(workspacePath), feedbackId);
 }
 
 /** List feedback items with optional filters. */
@@ -56,29 +39,7 @@ export async function listFeedback(
   workspacePath: string,
   filters?: { status?: string; pageUrl?: string; taskId?: string },
 ): Promise<VisualFeedback[]> {
-  const dir = path.join(workspacePath, 'feedback', 'items');
-  if (!(await pathExists(dir))) return [];
-
-  const entries = await listDir(dir);
-  const items: VisualFeedback[] = [];
-
-  for (const entry of entries) {
-    if (!entry.endsWith('.json')) continue;
-    try {
-      const raw = await readJson<unknown>(path.join(dir, entry));
-      const item = VisualFeedbackSchema.parse(raw);
-
-      if (filters?.status && item.status !== filters.status) continue;
-      if (filters?.pageUrl && item.pageUrl !== filters.pageUrl) continue;
-      if (filters?.taskId && item.taskId !== filters.taskId) continue;
-
-      items.push(item);
-    } catch {
-      // Skip malformed feedback files
-    }
-  }
-
-  return items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return dbListFeedback(getDb(workspacePath), filters);
 }
 
 // ─── Import from providers ───────────────────────────────────────────────────
@@ -260,6 +221,7 @@ export async function createPlanFromFeedback(
   const planSlug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
   const planPath = path.join(plansDir, `${planSlug}-${planId}.json`);
   await writeJson(planPath, plan);
+  dbSavePlanMeta(getDb(workspacePath), plan, planPath);
 
   // Create task record
   const taskRecord = await createTask(workspacePath, planId, planPath, title, clientSlug);
@@ -295,9 +257,7 @@ export async function createFeedbackSession(
     status: 'active',
   });
 
-  const dir = path.join(workspacePath, 'feedback', 'sessions');
-  await ensureDir(dir);
-  await writeJson(feedbackSessionPath(workspacePath, id), session);
+  dbCreateSession(getDb(workspacePath), session);
 
   logger.info(`Feedback session started: ${id}`);
   return session;

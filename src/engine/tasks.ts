@@ -8,9 +8,9 @@
 
 import path from 'path';
 import crypto from 'crypto';
-import { writeJson, readJson, pathExists, ensureDir, listDir } from './fs.js';
 import { TaskRecordSchema, type TaskRecord, type TaskStatus } from '../core/schemas.js';
 import { logger } from '../core/logger.js';
+import { getDb, dbCreateTask, dbLoadTask, dbSaveTask, dbListTasks, dbFindTaskByPrefix } from './db.js';
 
 const TASK_FILENAME = 'task.yaml';
 
@@ -46,8 +46,7 @@ export async function createTask(
     updatedAt: now,
   });
 
-  await ensureDir(taskDir(workspacePath, id));
-  await writeJson(taskFilePath(workspacePath, id), task);
+  dbCreateTask(getDb(workspacePath), task);
 
   logger.debug(`Task created: ${id}`);
   return task;
@@ -58,15 +57,7 @@ export async function loadTask(
   workspacePath: string,
   taskId: string,
 ): Promise<TaskRecord | null> {
-  const fp = taskFilePath(workspacePath, taskId);
-  if (!(await pathExists(fp))) return null;
-  try {
-    const raw = await readJson<unknown>(fp);
-    return TaskRecordSchema.parse(raw);
-  } catch (err) {
-    logger.warn(`Could not parse task ${taskId}: ${(err as Error).message}`);
-    return null;
-  }
+  return dbLoadTask(getDb(workspacePath), taskId);
 }
 
 /** Save (overwrite) a task record. */
@@ -75,7 +66,7 @@ export async function saveTask(
   task: TaskRecord,
 ): Promise<void> {
   task.updatedAt = new Date().toISOString();
-  await writeJson(taskFilePath(workspacePath, task.id), task);
+  dbSaveTask(getDb(workspacePath), task);
 }
 
 /** Update specific fields on a task. */
@@ -122,24 +113,7 @@ export async function transitionTask(
 
 /** List all tasks in the workspace. */
 export async function listTasks(workspacePath: string): Promise<TaskRecord[]> {
-  const tasksRoot = path.join(workspacePath, 'tasks');
-  if (!(await pathExists(tasksRoot))) return [];
-
-  const entries = await listDir(tasksRoot);
-  const tasks: TaskRecord[] = [];
-
-  for (const entry of entries) {
-    const fp = path.join(tasksRoot, entry, TASK_FILENAME);
-    if (!(await pathExists(fp))) continue;
-    try {
-      const raw = await readJson<unknown>(fp);
-      tasks.push(TaskRecordSchema.parse(raw));
-    } catch {
-      // Skip malformed task files
-    }
-  }
-
-  return tasks.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return dbListTasks(getDb(workspacePath));
 }
 
 /** Find a task by partial ID prefix (first 8+ chars). */
@@ -147,9 +121,7 @@ export async function findTaskByPrefix(
   workspacePath: string,
   prefix: string,
 ): Promise<TaskRecord | null> {
-  const all = await listTasks(workspacePath);
-  const match = all.find((t) => t.id.startsWith(prefix) || t.id === prefix);
-  return match ?? null;
+  return dbFindTaskByPrefix(getDb(workspacePath), prefix);
 }
 
 /** Valid status transitions. */

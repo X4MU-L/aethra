@@ -12,10 +12,15 @@ import { loadLatestAudit } from "../../audit/runner.js";
 import { getGitStatus } from "../../engine/git.js";
 import { queryOutput } from "../../engine/subprocess.js";
 import { writeJson, writeFile, ensureDir } from "../../engine/fs.js";
+import { getDb, dbSavePlanMeta } from "../../engine/db.js";
 import { createTask } from "../../engine/tasks.js";
 import { logger } from "../../core/logger.js";
 import { toAethraError } from "../../core/errors.js";
-import type { ImplementationPlan, EvidenceItem, PlanSnapshot } from "../../core/schemas.js";
+import type {
+  ImplementationPlan,
+  EvidenceItem,
+  PlanSnapshot,
+} from "../../core/schemas.js";
 
 export function registerPlanFixCommand(program: Command): void {
   program
@@ -97,7 +102,7 @@ export function registerPlanFixCommand(program: Command): void {
 
         // 3b. Record plan snapshot for freshness checking
         if (config.repositoryPath && gitStatus?.isRepo) {
-          const headCommit = await queryOutput('git', ['rev-parse', 'HEAD'], {
+          const headCommit = await queryOutput("git", ["rev-parse", "HEAD"], {
             cwd: config.repositoryPath,
           });
           const snapshot: PlanSnapshot = {
@@ -191,8 +196,17 @@ export function registerPlanFixCommand(program: Command): void {
           generatePlanMarkdown(plan, task, config.name),
         );
 
+        // Index plan metadata in the database
+        dbSavePlanMeta(getDb(workspacePath), plan, planJsonPath);
+
         // Create a task record to track the lifecycle of this plan
-        const taskRecord = await createTask(workspacePath, planId, planJsonPath, task, config.slug);
+        const taskRecord = await createTask(
+          workspacePath,
+          planId,
+          planJsonPath,
+          task,
+          config.slug,
+        );
 
         if (opts.json || cmd.parent?.opts()?.json) {
           console.log(JSON.stringify(plan, null, 2));
@@ -218,9 +232,21 @@ export function registerPlanFixCommand(program: Command): void {
 
         console.log(chalk.bold("\n  Next steps:\n"));
         console.log(chalk.gray(`  1. Review the plan: ${planMdPath}`));
-        console.log(chalk.gray("  2. Use an AI agent to investigate and complete the plan"));
-        console.log(chalk.gray(`  3. Approve: aethra task approve ${taskRecord.id.slice(0, 8)}`));
-        console.log(chalk.gray(`  4. Verify: aethra verify --task ${taskRecord.id.slice(0, 8)}\n`));
+        console.log(
+          chalk.gray(
+            "  2. Use an AI agent to investigate and complete the plan",
+          ),
+        );
+        console.log(
+          chalk.gray(
+            `  3. Approve: aethra task approve ${taskRecord.id.slice(0, 8)}`,
+          ),
+        );
+        console.log(
+          chalk.gray(
+            `  4. Verify: aethra verify --task ${taskRecord.id.slice(0, 8)}\n`,
+          ),
+        );
 
         console.log(
           chalk.yellow(
