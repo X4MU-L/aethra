@@ -195,6 +195,34 @@ const MIGRATIONS: Array<{ version: number; description: string; sql: string }> =
       CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status);
     `,
     },
+    {
+      version: 2,
+      description: "Idempotent imports, provider metadata, session mappings",
+      sql: `
+    DELETE FROM feedback_items
+    WHERE rowid NOT IN (
+      SELECT MAX(rowid) FROM feedback_items
+      WHERE provider_annotation_id IS NOT NULL
+      GROUP BY provider, provider_annotation_id, client_id
+    ) AND provider_annotation_id IS NOT NULL;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_provider_dedup
+      ON feedback_items(provider, provider_annotation_id, client_id)
+      WHERE provider_annotation_id IS NOT NULL;
+
+    ALTER TABLE feedback_items ADD COLUMN provider_metadata TEXT DEFAULT NULL;
+
+    CREATE TABLE IF NOT EXISTS session_mappings (
+      agentation_session_id TEXT NOT NULL,
+      client_slug TEXT NOT NULL,
+      workspace_path TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (agentation_session_id, client_slug)
+    );
+    CREATE INDEX IF NOT EXISTS idx_session_mappings_client
+      ON session_mappings(client_slug);
+  `,
+    },
   ];
 
 function runMigrations(db: Database.Database): void {
@@ -325,6 +353,7 @@ interface FeedbackRow {
   accessibility_context: string | null;
   nearby_text: string | null;
   screenshot_reference: string | null;
+  provider_metadata: string | null;
   created_at: string;
   status: string;
   resolution_summary: string | null;
@@ -364,6 +393,7 @@ function rowToFeedback(row: FeedbackRow): VisualFeedback {
     accessibilityContext: jsonParse(row.accessibility_context, undefined),
     nearbyText: row.nearby_text ?? undefined,
     screenshotReference: row.screenshot_reference ?? undefined,
+    providerMetadata: jsonParse(row.provider_metadata, undefined),
     createdAt: row.created_at,
     status: row.status as VisualFeedback["status"],
     resolutionSummary: row.resolution_summary ?? undefined,
@@ -403,6 +433,9 @@ function feedbackToRow(fb: VisualFeedback): FeedbackRow {
       : null,
     nearby_text: fb.nearbyText ?? null,
     screenshot_reference: fb.screenshotReference ?? null,
+    provider_metadata: fb.providerMetadata
+      ? JSON.stringify(fb.providerMetadata)
+      : null,
     created_at: fb.createdAt,
     status: fb.status,
     resolution_summary: fb.resolutionSummary ?? null,
@@ -541,13 +574,13 @@ export function dbSaveFeedback(
   const row = feedbackToRow(feedback);
   db.prepare(
     `
-    INSERT OR REPLACE INTO feedback_items (
+    INSERT INTO feedback_items (
       id, provider, provider_annotation_id, client_id, project_id, task_id, session_id,
       page_url, viewport_width, viewport_height, viewport_scale,
       comment, kind, intent, severity,
       element_tag, element_selector, bounding_box, source_file,
       component_tree, css_classes, computed_styles, accessibility_context,
-      nearby_text, screenshot_reference,
+      nearby_text, screenshot_reference, provider_metadata,
       created_at, status, resolution_summary,
       related_finding_ids, related_feedback_ids)
     VALUES (
@@ -556,9 +589,25 @@ export function dbSaveFeedback(
       @comment, @kind, @intent, @severity,
       @element_tag, @element_selector, @bounding_box, @source_file,
       @component_tree, @css_classes, @computed_styles, @accessibility_context,
-      @nearby_text, @screenshot_reference,
+      @nearby_text, @screenshot_reference, @provider_metadata,
       @created_at, @status, @resolution_summary,
       @related_finding_ids, @related_feedback_ids)
+    ON CONFLICT(id) DO UPDATE SET
+      comment = excluded.comment,
+      kind = excluded.kind,
+      intent = excluded.intent,
+      severity = excluded.severity,
+      element_tag = excluded.element_tag,
+      element_selector = excluded.element_selector,
+      bounding_box = excluded.bounding_box,
+      source_file = excluded.source_file,
+      component_tree = excluded.component_tree,
+      css_classes = excluded.css_classes,
+      computed_styles = excluded.computed_styles,
+      accessibility_context = excluded.accessibility_context,
+      nearby_text = excluded.nearby_text,
+      page_url = excluded.page_url,
+      provider_metadata = excluded.provider_metadata
   `,
   ).run(row);
 }
@@ -601,6 +650,52 @@ export function dbListFeedback(
   return rows.map(rowToFeedback);
 }
 
+/** Update lifecycle fields that the upsert deliberately preserves. */
+export function dbUpdateFeedbackLifecycle(
+  db: Database.Database,
+  feedbackId: string,
+  fields: {
+    status?: string;
+    taskId?: string;
+    resolutionSummary?: string;
+  },
+): void {
+  const setClauses: string[] = [];
+  const params: Record<string, string> = { id: feedbackId };
+
+  if (fields.status !== undefined) {
+    setClauses.push("status = @status");
+    params.status = fields.status;
+  }
+  if (fields.taskId !== undefined) {
+    setClauses.push("task_id = @taskId");
+    params.taskId = fields.taskId;
+  }
+  if (fields.resolutionSummary !== undefined) {
+    setClauses.push("resolution_summary = @resolutionSummary");
+    params.resolutionSummary = fields.resolutionSummary;
+  }
+
+  if (setClauses.length === 0) return;
+  db.prepare(
+    `UPDATE feedback_items SET ${setClauses.join(", ")} WHERE id = @id`,
+  ).run(params);
+}
+
+export function dbFindFeedbackByProviderAnnotation(
+  db: Database.Database,
+  provider: string,
+  providerAnnotationId: string,
+  clientId: string,
+): VisualFeedback | null {
+  const row = db
+    .prepare(
+      "SELECT * FROM feedback_items WHERE provider = ? AND provider_annotation_id = ? AND client_id = ?",
+    )
+    .get(provider, providerAnnotationId, clientId) as FeedbackRow | undefined;
+  return row ? rowToFeedback(row) : null;
+}
+
 // ─── Session CRUD ────────────────────────────────────────────────────────────
 
 export function dbCreateSession(
@@ -626,6 +721,52 @@ export function dbLoadSession(
     .prepare("SELECT * FROM feedback_sessions WHERE id = ?")
     .get(sessionId) as SessionRow | undefined;
   return row ? rowToSession(row) : null;
+}
+
+// ─── Session mappings ────────────────────────────────────────────────────────
+
+export function dbSaveSessionMapping(
+  db: Database.Database,
+  agentationSessionId: string,
+  clientSlug: string,
+  workspacePath: string,
+): void {
+  db.prepare(
+    `
+    INSERT OR REPLACE INTO session_mappings (agentation_session_id, client_slug, workspace_path, created_at)
+    VALUES (?, ?, ?, ?)
+  `,
+  ).run(
+    agentationSessionId,
+    clientSlug,
+    workspacePath,
+    new Date().toISOString(),
+  );
+}
+
+export function dbGetSessionsForClient(
+  db: Database.Database,
+  clientSlug: string,
+): string[] {
+  const rows = db
+    .prepare(
+      "SELECT agentation_session_id FROM session_mappings WHERE client_slug = ?",
+    )
+    .all(clientSlug) as Array<{ agentation_session_id: string }>;
+  return rows.map((r) => r.agentation_session_id);
+}
+
+export function dbIsSessionMapped(
+  db: Database.Database,
+  agentationSessionId: string,
+  clientSlug: string,
+): boolean {
+  const row = db
+    .prepare(
+      "SELECT 1 FROM session_mappings WHERE agentation_session_id = ? AND client_slug = ?",
+    )
+    .get(agentationSessionId, clientSlug);
+  return row !== undefined;
 }
 
 // ─── Audit run CRUD ──────────────────────────────────────────────────────────

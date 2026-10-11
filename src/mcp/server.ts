@@ -19,6 +19,7 @@ import {
   SubscribeRequestSchema,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { parseArgs } from "node:util";
 import path from "path";
 import fs from "fs-extra";
 import yaml from "js-yaml";
@@ -50,19 +51,44 @@ const server = new Server(
   },
 );
 
-// Workspace path — resolved from CLI arg or environment
-const workspacePath =
-  process.argv[2] ?? process.env["AETHRA_WORKSPACE"] ?? process.cwd();
+function resolveWorkspacePath(): string {
+  // When imported from CLI (aethra mcp start), AETHRA_WORKSPACE is set
+  const envWorkspace = process.env["AETHRA_WORKSPACE"];
+  if (envWorkspace) return envWorkspace;
 
-// Validate workspace at startup
-const configCheckPath = path.join(workspacePath, "client.yaml");
-fs.pathExists(configCheckPath).then((exists) => {
-  if (!exists) {
-    process.stderr.write(
-      `Warning: ${workspacePath} does not appear to be an Aethra workspace (no client.yaml found).\n`,
-    );
+  // When run standalone (aethra-mcp --workspace <path>)
+  try {
+    const { values, positionals } = parseArgs({
+      args: process.argv.slice(2),
+      options: {
+        workspace: { type: "string", short: "w" },
+      },
+      allowPositionals: true,
+      strict: false,
+    });
+
+    const wp = (values.workspace as string) ?? positionals[0];
+    if (wp) return wp;
+  } catch {
+    // Fall through
   }
-});
+
+  process.stderr.write(
+    "Error: workspace path required. Use --workspace <path> or set AETHRA_WORKSPACE.\n",
+  );
+  process.exit(1);
+}
+
+const workspacePath = resolveWorkspacePath();
+
+// Validate workspace upfront
+const configCheckPath = path.join(workspacePath, "client.yaml");
+if (!fs.pathExistsSync(configCheckPath)) {
+  process.stderr.write(
+    `Error: ${workspacePath} is not a valid Aethra workspace (no client.yaml found).\n`,
+  );
+  process.exit(1);
+}
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 

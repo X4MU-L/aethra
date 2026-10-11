@@ -11,41 +11,100 @@
  * Security:
  * - Only operates on loopback/localhost URLs
  * - Refuses to connect to production URLs
+ * - Session-scoped retrieval: only fetches from sessions mapped to the active client
  * - Toolbar must not be present in production builds
  */
 
 import crypto from "crypto";
+import { z } from "zod";
 import type { PlatformType, ClientConfig } from "../../core/schemas.js";
 import type { VisualFeedback } from "../schema.js";
-import { VisualFeedbackSchema } from "../schema.js";
+import { VisualFeedbackSchema, BoundingBoxSchema } from "../schema.js";
 import type {
   ProviderCapabilities,
   ProviderStatus,
   RawAnnotation,
 } from "./base.js";
 import { VisualFeedbackProvider } from "./base.js";
+import { VisualFeedbackError } from "../../core/errors.js";
 import { logger } from "../../core/logger.js";
+import {
+  getDb,
+  dbGetSessionsForClient,
+  dbSaveSessionMapping,
+} from "../../engine/db.js";
 
-// Severity mapping: Agentation → Aethra
+// ─── Upstream annotation schema (Agentation API) ────────────────────────────
+
+const AgentationAnnotationSchema = z.object({
+  id: z.string(),
+  comment: z.string(),
+  elementPath: z.string(),
+  timestamp: z.union([z.number(), z.string()]),
+  x: z.number(),
+  y: z.number(),
+  element: z.string(),
+  // Optional fields
+  url: z.string().url().optional(),
+  severity: z.string().optional(),
+  kind: z.string().optional(),
+  intent: z.string().optional(),
+  boundingBox: BoundingBoxSchema.optional(),
+  reactComponents: z.array(z.string()).optional(),
+  cssClasses: z.array(z.string()).optional(),
+  sourceFile: z.string().optional(),
+  attributes: z.record(z.unknown()).optional(),
+  computedStyles: z.record(z.string()).optional(),
+  accessibility: z
+    .object({
+      role: z.string().optional(),
+      ariaLabel: z.string().optional(),
+      contrast: z.number().optional(),
+      violations: z.array(z.string()).optional(),
+    })
+    .optional(),
+  nearbyText: z.string().optional(),
+  selectedText: z.string().optional(),
+  // Structured design input
+  placement: z
+    .object({
+      component: z.string().optional(),
+      width: z.number().optional(),
+      height: z.number().optional(),
+      position: z.string().optional(),
+    })
+    .optional(),
+  rearrange: z
+    .object({
+      originalBounds: BoundingBoxSchema.optional(),
+      currentBounds: BoundingBoxSchema.optional(),
+    })
+    .optional(),
+  // Internal — injected by retrievePending
+  _sessionId: z.string().optional(),
+});
+
+// ─── Enum mappings ───────────────────────────────────────────────────────────
+
 const SEVERITY_MAP: Record<string, string> = {
   blocking: "critical",
   important: "high",
   suggestion: "medium",
 };
 
-// Kind mapping: Agentation → Aethra
 const KIND_MAP: Record<string, string> = {
   placement: "style",
   rearrange: "enhancement",
 };
 
-// Intent mapping: Agentation → Aethra
 const INTENT_MAP: Record<string, string> = {
   fix: "fix",
   change: "investigate",
   question: "investigate",
   approve: "approve",
 };
+
+// ─── Provider ────────────────────────────────────────────────────────────────
 
 export class AgentationProvider extends VisualFeedbackProvider {
   readonly name = "agentation";
@@ -54,15 +113,38 @@ export class AgentationProvider extends VisualFeedbackProvider {
   private baseUrl = "http://localhost:4747";
   private serverHandle: { close: () => void } | null = null;
   private sseAbort: AbortController | null = null;
+  private workspacePath: string | null = null;
+
+  /** Set workspace context for DB-backed operations (session mapping, etc.) */
+  setContext(workspacePath: string): void {
+    this.workspacePath = workspacePath;
+  }
 
   async checkAvailability(): Promise<ProviderStatus> {
+    // Check if agentation-mcp package is installed
+    let installed = false;
+    try {
+      await import("agentation-mcp");
+      installed = true;
+    } catch {
+      return {
+        available: false,
+        connected: false,
+        version: null,
+        error:
+          "agentation-mcp package is not installed. Run: npm install agentation-mcp",
+        capabilities: this.reportCapabilities(),
+      };
+    }
+
+    // Package installed — check if server is running
     try {
       const res = await fetch(`${this.baseUrl}/health`, {
         signal: AbortSignal.timeout(3000),
       });
       const connected = res.ok;
       return {
-        available: true,
+        available: installed,
         connected,
         version: null,
         error: connected
@@ -72,7 +154,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
       };
     } catch {
       return {
-        available: true,
+        available: installed,
         connected: false,
         version: null,
         error:
@@ -117,41 +199,85 @@ export class AgentationProvider extends VisualFeedbackProvider {
       };
     }
 
-    logger.info(`Agentation session prepared for ${opts.pageUrl}`);
-    return {
-      success: true,
-      sessionUrl: opts.pageUrl,
-    };
-  }
-
-  async retrievePending(_clientSlug: string): Promise<RawAnnotation[]> {
+    // Create a real session on the Agentation server
     try {
-      // Get all sessions
-      const sessionsRes = await fetch(`${this.baseUrl}/sessions`, {
+      const res = await fetch(`${this.baseUrl}/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: opts.pageUrl,
+        }),
         signal: AbortSignal.timeout(5000),
       });
-      if (!sessionsRes.ok) {
-        logger.warn(
-          `Agentation: failed to list sessions (${sessionsRes.status})`,
-        );
-        return [];
+
+      if (!res.ok) {
+        return {
+          success: false,
+          error: `Failed to create Agentation session: HTTP ${res.status}`,
+        };
       }
 
-      const sessions = (await sessionsRes.json()) as Array<{ id: string }>;
+      const session = (await res.json()) as { id: string };
+      const agentationSessionId = session.id ?? opts.sessionId;
+
+      // Map the session to this client workspace
+      if (this.workspacePath) {
+        dbSaveSessionMapping(
+          getDb(this.workspacePath),
+          agentationSessionId,
+          opts.clientSlug,
+          this.workspacePath,
+        );
+      }
+
+      logger.info(
+        `Agentation session ${agentationSessionId} created and mapped to client "${opts.clientSlug}"`,
+      );
+      return {
+        success: true,
+        sessionUrl: opts.pageUrl,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        error: `Could not reach Agentation server: ${(err as Error).message}`,
+      };
+    }
+  }
+
+  async retrievePending(clientSlug: string): Promise<RawAnnotation[]> {
+    // Enforce session isolation: only fetch from sessions mapped to this client
+    if (!this.workspacePath) {
+      logger.warn(
+        "Agentation: no workspace context set — cannot filter by client. Call setContext() first.",
+      );
+      return [];
+    }
+
+    const db = getDb(this.workspacePath);
+    const mappedSessionIds = dbGetSessionsForClient(db, clientSlug);
+
+    if (mappedSessionIds.length === 0) {
+      logger.debug(
+        `Agentation: no sessions mapped to client "${clientSlug}". Use 'aethra feedback watch' to create a session.`,
+      );
+      return [];
+    }
+
+    try {
       const allPending: RawAnnotation[] = [];
 
-      // Get pending annotations from each session
-      for (const session of sessions) {
+      for (const sessionId of mappedSessionIds) {
         try {
           const pendingRes = await fetch(
-            `${this.baseUrl}/sessions/${session.id}/pending`,
+            `${this.baseUrl}/sessions/${sessionId}/pending`,
             { signal: AbortSignal.timeout(5000) },
           );
           if (!pendingRes.ok) continue;
 
           const annotations = (await pendingRes.json()) as RawAnnotation[];
           for (const ann of annotations) {
-            allPending.push({ ...ann, _sessionId: session.id });
+            allPending.push({ ...ann, _sessionId: sessionId });
           }
         } catch {
           // Skip sessions that fail
@@ -159,7 +285,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
       }
 
       logger.info(
-        `Agentation: retrieved ${allPending.length} pending annotations from ${sessions.length} session(s)`,
+        `Agentation: retrieved ${allPending.length} pending annotations from ${mappedSessionIds.length} mapped session(s) for client "${clientSlug}"`,
       );
       return allPending;
     } catch (err) {
@@ -171,48 +297,81 @@ export class AgentationProvider extends VisualFeedbackProvider {
   }
 
   normalize(raw: RawAnnotation, clientSlug: string): VisualFeedback {
-    const now = new Date().toISOString();
-    const rawSeverity = String(raw["severity"] ?? "suggestion");
-    const rawKind = String(raw["kind"] ?? "feedback");
-    const rawIntent = String(raw["intent"] ?? "fix");
+    // Step 1: Parse and validate the upstream shape
+    const parseResult = AgentationAnnotationSchema.safeParse(raw);
+    if (!parseResult.success) {
+      throw new VisualFeedbackError(
+        `Invalid Agentation annotation (id=${String(raw.id ?? "unknown")}): ${parseResult.error.message}`,
+      );
+    }
+    const ann = parseResult.data;
+
+    // Step 2: Convert timestamp (numeric ms epoch → ISO string)
+    let createdAt: string;
+    if (typeof ann.timestamp === "number") {
+      createdAt = new Date(ann.timestamp).toISOString();
+    } else {
+      createdAt = ann.timestamp;
+    }
+
+    // Step 3: Require URL — reject if missing
+    if (!ann.url) {
+      throw new VisualFeedbackError(
+        `Agentation annotation ${ann.id} has no URL; cannot import without page context`,
+      );
+    }
+
+    // Step 4: Map enums
+    const rawSeverity = ann.severity ?? "suggestion";
+    const rawKind = ann.kind ?? "feedback";
+    const rawIntent = ann.intent ?? "fix";
 
     const kind =
       rawKind === "feedback"
-        ? this.inferKindFromComment(raw)
+        ? this.inferKindFromComment(ann.comment)
         : (KIND_MAP[rawKind] ?? "other");
 
+    // Step 5: Stable ID derivation (deterministic from provider annotation + client)
+    const stableId = crypto
+      .createHash("sha256")
+      .update(`agentation:${ann.id}:${clientSlug}`)
+      .digest("hex")
+      .slice(0, 16);
+
+    // Step 6: Preserve structured provider data
+    const providerMetadata: Record<string, unknown> = {};
+    if (ann.placement) providerMetadata.placement = ann.placement;
+    if (ann.rearrange) providerMetadata.rearrange = ann.rearrange;
+    if (ann.selectedText) providerMetadata.selectedText = ann.selectedText;
+    if (ann.attributes) providerMetadata.attributes = ann.attributes;
+    // Preserve original kind for structured annotations
+    if (rawKind === "placement" || rawKind === "rearrange") {
+      providerMetadata.originalKind = rawKind;
+    }
+
     return VisualFeedbackSchema.parse({
-      id: crypto.randomBytes(8).toString("hex"),
+      id: stableId,
       provider: this.name,
-      providerAnnotationId: String(raw["id"]),
+      providerAnnotationId: ann.id,
       clientId: clientSlug,
-      sessionId: raw["_sessionId"] as string | undefined,
-      pageUrl: raw["url"] ?? raw["pageUrl"] ?? "https://unknown",
-      comment: raw["comment"] ?? "",
+      sessionId: ann._sessionId,
+      pageUrl: ann.url,
+      comment: ann.comment,
       kind,
       intent: INTENT_MAP[rawIntent] ?? "investigate",
       severity: SEVERITY_MAP[rawSeverity] ?? "medium",
-      elementSelector: raw["elementPath"] as string | undefined,
-      elementTag: raw["element"] as string | undefined,
-      boundingBox: raw["boundingBox"] as
-        | { x: number; y: number; width: number; height: number }
-        | undefined,
-      componentTree: raw["reactComponents"] as string[] | undefined,
-      cssClasses: raw["cssClasses"] as string[] | undefined,
-      sourceFile: raw["sourceFile"] as string | undefined,
-      nearbyText: raw["nearbyText"] as string | undefined,
-      computedStyles: raw["computedStyles"] as
-        | Record<string, string>
-        | undefined,
-      accessibilityContext: raw["accessibility"] as
-        | {
-            role?: string;
-            ariaLabel?: string;
-            contrast?: number;
-            violations?: string[];
-          }
-        | undefined,
-      createdAt: (raw["timestamp"] as string) ?? now,
+      elementSelector: ann.elementPath,
+      elementTag: ann.element,
+      boundingBox: ann.boundingBox,
+      componentTree: ann.reactComponents,
+      cssClasses: ann.cssClasses,
+      sourceFile: ann.sourceFile,
+      nearbyText: ann.nearbyText,
+      computedStyles: ann.computedStyles,
+      accessibilityContext: ann.accessibility,
+      providerMetadata:
+        Object.keys(providerMetadata).length > 0 ? providerMetadata : undefined,
+      createdAt,
       status: "pending",
     });
   }
@@ -222,27 +381,27 @@ export class AgentationProvider extends VisualFeedbackProvider {
     resolution?: { status: string; summary: string },
   ): Promise<void> {
     try {
-      if (resolution?.status === "resolved") {
-        await fetch(`${this.baseUrl}/annotations/${annotationId}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            isFixed: true,
-            resolution: resolution.summary,
-          }),
-          signal: AbortSignal.timeout(5000),
-        });
-      } else if (resolution?.status === "dismissed") {
-        await fetch(`${this.baseUrl}/annotations/${annotationId}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            dismissed: true,
-            dismissReason: resolution.summary,
-          }),
-          signal: AbortSignal.timeout(5000),
-        });
+      const body =
+        resolution?.status === "resolved"
+          ? { isFixed: true, resolution: resolution.summary }
+          : resolution?.status === "dismissed"
+            ? { dismissed: true, dismissReason: resolution.summary }
+            : { acknowledged: true };
+
+      const res = await fetch(`${this.baseUrl}/annotations/${annotationId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(5000),
+      });
+
+      if (!res.ok) {
+        logger.warn(
+          `Agentation: acknowledge HTTP ${res.status} for ${annotationId}`,
+        );
+        return;
       }
+
       logger.debug(`Agentation: acknowledged ${annotationId}`);
     } catch (err) {
       logger.warn(
@@ -264,7 +423,6 @@ export class AgentationProvider extends VisualFeedbackProvider {
 
   // ─── Server lifecycle ────────────────────────────────────────────────────
 
-  /** Start the Agentation HTTP server programmatically. */
   async startServer(port?: number): Promise<void> {
     if (this.serverHandle) {
       logger.warn("Agentation server already running");
@@ -286,7 +444,6 @@ export class AgentationProvider extends VisualFeedbackProvider {
     }
   }
 
-  /** Stop the Agentation HTTP server. */
   async stopServer(): Promise<void> {
     if (this.sseAbort) {
       this.sseAbort.abort();
@@ -299,7 +456,6 @@ export class AgentationProvider extends VisualFeedbackProvider {
     }
   }
 
-  /** Subscribe to real-time annotation events via SSE. */
   async subscribeToEvents(
     callback: (annotation: RawAnnotation) => void,
   ): Promise<void> {
@@ -379,39 +535,35 @@ export class AgentationProvider extends VisualFeedbackProvider {
     }
   }
 
-  private inferKindFromComment(raw: RawAnnotation): string {
-    const comment = String(raw["comment"] ?? "").toLowerCase();
+  private inferKindFromComment(comment: string): string {
+    const lower = comment.toLowerCase();
     if (
-      comment.includes("bug") ||
-      comment.includes("broken") ||
-      comment.includes("error")
+      lower.includes("bug") ||
+      lower.includes("broken") ||
+      lower.includes("error")
     )
       return "bug";
     if (
-      comment.includes("style") ||
-      comment.includes("css") ||
-      comment.includes("color")
+      lower.includes("style") ||
+      lower.includes("css") ||
+      lower.includes("color")
     )
       return "style";
-    if (comment.includes("accessibility") || comment.includes("a11y"))
+    if (lower.includes("accessibility") || lower.includes("a11y"))
       return "accessibility";
     if (
-      comment.includes("content") ||
-      comment.includes("text") ||
-      comment.includes("copy")
+      lower.includes("content") ||
+      lower.includes("text") ||
+      lower.includes("copy")
     )
       return "content";
     if (
-      comment.includes("improve") ||
-      comment.includes("enhance") ||
-      comment.includes("better")
+      lower.includes("improve") ||
+      lower.includes("enhance") ||
+      lower.includes("better")
     )
       return "enhancement";
-    if (
-      comment.includes("?") ||
-      comment.includes("why") ||
-      comment.includes("how")
-    )
+    if (lower.includes("?") || lower.includes("why") || lower.includes("how"))
       return "question";
     return "other";
   }

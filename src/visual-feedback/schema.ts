@@ -104,6 +104,9 @@ export const VisualFeedbackSchema = z.object({
   // Evidence
   screenshotReference: z.string().optional(),
 
+  // Provider-specific structured data (placement, rearrange, etc.)
+  providerMetadata: z.record(z.unknown()).optional(),
+
   // Lifecycle
   createdAt: IsoTimestampSchema,
   status: VisualFeedbackStatusSchema.default("pending"),

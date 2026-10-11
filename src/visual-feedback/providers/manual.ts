@@ -6,6 +6,7 @@
 
 import crypto from "crypto";
 import type { PlatformType, ClientConfig } from "../../core/schemas.js";
+import { VisualFeedbackError } from "../../core/errors.js";
 import type { VisualFeedback } from "../schema.js";
 import { VisualFeedbackSchema } from "../schema.js";
 import type {
@@ -46,19 +47,26 @@ export class ManualFeedbackProvider extends VisualFeedbackProvider {
   }
 
   async retrievePending(_clientSlug: string): Promise<RawAnnotation[]> {
-    // Manual provider doesn't have a remote source to poll.
-    // Feedback items are already in the workspace as JSON files.
+    // Manual provider does not poll an external source.
+    // Manual feedback is created via CLI commands and stored directly in SQLite.
     return [];
   }
 
   normalize(raw: RawAnnotation, clientSlug: string): VisualFeedback {
     const now = new Date().toISOString();
+    const pageUrl = (raw["pageUrl"] ?? raw["url"]) as string | undefined;
+    if (!pageUrl) {
+      throw new VisualFeedbackError(
+        `Manual feedback annotation ${raw.id ?? "unknown"} has no pageUrl`,
+      );
+    }
+
     return VisualFeedbackSchema.parse({
       id: raw["id"] ?? crypto.randomBytes(8).toString("hex"),
       provider: this.name,
-      providerAnnotationId: String(raw["id"]),
+      providerAnnotationId: raw["id"] ? String(raw["id"]) : undefined,
       clientId: clientSlug,
-      pageUrl: raw["pageUrl"] ?? raw["url"] ?? "https://unknown",
+      pageUrl,
       comment: raw["comment"] ?? raw["text"] ?? "",
       kind: raw["kind"] ?? "other",
       intent: raw["intent"] ?? "investigate",
