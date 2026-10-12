@@ -63,7 +63,12 @@ export async function importFeedback(
   workspacePath: string,
   clientSlug: string,
   providerName: string,
-): Promise<{ imported: VisualFeedback[]; errors: string[] }> {
+): Promise<{
+  imported: VisualFeedback[];
+  errors: string[];
+  newCount: number;
+  updatedCount: number;
+}> {
   const provider = getProvider(providerName);
   if (!provider) {
     throw new VisualFeedbackError(`Unknown provider: ${providerName}`);
@@ -122,10 +127,13 @@ export async function importFeedback(
 
   const imported: VisualFeedback[] = [];
   const db = getDb(workspacePath);
+  let newCount = 0;
+  let updatedCount = 0;
 
   for (const raw of rawAnnotations) {
     try {
       const feedback = provider.normalize(raw, clientSlug);
+      let isNew = true;
 
       // Deduplication: check if this annotation was already imported
       if (feedback.providerAnnotationId) {
@@ -136,6 +144,7 @@ export async function importFeedback(
           feedback.clientId,
         );
         if (existing) {
+          isNew = false;
           // Preserve existing Aethra ID, task links, and resolution status
           feedback.id = existing.id;
           feedback.status = existing.status;
@@ -146,6 +155,11 @@ export async function importFeedback(
 
       await saveFeedback(workspacePath, feedback);
       imported.push(feedback);
+      if (isNew) {
+        newCount++;
+      } else {
+        updatedCount++;
+      }
     } catch (err) {
       errors.push(
         `Failed to normalize annotation ${raw.id}: ${(err as Error).message}`,
@@ -154,13 +168,13 @@ export async function importFeedback(
   }
 
   logger.info(
-    `Imported ${imported.length} feedback items from ${providerName}`,
+    `Imported ${imported.length} feedback items from ${providerName} (${newCount} new, ${updatedCount} updated)`,
   );
   if (errors.length > 0) {
     logger.warn(`${errors.length} import errors`);
   }
 
-  return { imported, errors };
+  return { imported, errors, newCount, updatedCount };
 }
 
 // ─── Lifecycle operations ────────────────────────────────────────────────────

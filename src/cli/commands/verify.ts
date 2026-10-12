@@ -213,7 +213,10 @@ export function registerVerifyCommand(program: Command): void {
                       notes:
                         "No design critique found. Consider running 'aethra design critique' for visual evaluation.",
                     });
-                  } else if (critique.reviewStatus === "pending") {
+                  } else if (
+                    critique.reviewStatus === "pending" ||
+                    critique.overallScore == null
+                  ) {
                     verificationResults.push({
                       criterion: "Design critique review",
                       passed: null,

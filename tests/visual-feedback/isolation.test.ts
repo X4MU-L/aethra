@@ -31,6 +31,7 @@ import {
   VisualFeedbackSchema,
   type VisualFeedback,
 } from "../../src/visual-feedback/schema.js";
+import { checkAnnotationWorkspaceOwnership } from "../../src/mcp/server.js";
 
 describe("Cross-workspace security isolation", () => {
   let tmpRoot: string;
@@ -107,30 +108,114 @@ describe("Cross-workspace security isolation", () => {
     expect(dbIsSessionMapped(dbB, "session-alpha", "client-b")).toBe(false);
   });
 
-  it("SSE ingestion filters out annotations belonging to another workspace", async () => {
+  it("AgentationProvider.processSSEEvent fails closed on missing sessionId", () => {
     const dbA = getDb(workspaceA);
     dbSaveSessionMapping(dbA, "session-alpha", "client-a", workspaceA);
 
     const provider = new AgentationProvider();
     provider.setContext(workspaceA);
 
-    // Simulate SSE filtering logic
     const receivedForA: unknown[] = [];
-    const simulatedHandler = (eventSessionId: string, payload: Record<string, unknown>) => {
-      if (!dbIsSessionMapped(dbA, eventSessionId, "client-a")) {
-        return; // dropped
-      }
-      receivedForA.push(payload);
+    const callback = (ann: unknown) => receivedForA.push(ann);
+
+    // Event with NO sessionId or payload.sessionId must fail closed and be rejected
+    const eventWithoutSession = {
+      type: "annotation.created",
+      payload: { id: "ann-no-session", comment: "No session metadata" },
     };
 
-    // Event from Workspace B's session
-    simulatedHandler("session-beta", { id: "ann-beta", comment: "Beta bug" });
+    const accepted = provider.processSSEEvent(eventWithoutSession, callback, "client-a");
+    expect(accepted).toBe(false);
+    expect(receivedForA).toHaveLength(0);
+  });
+
+  it("AgentationProvider.processSSEEvent drops annotations belonging to another workspace", () => {
+    const dbA = getDb(workspaceA);
+    dbSaveSessionMapping(dbA, "session-alpha", "client-a", workspaceA);
+
+    const provider = new AgentationProvider();
+    provider.setContext(workspaceA);
+
+    const receivedForA: unknown[] = [];
+    const callback = (ann: unknown) => receivedForA.push(ann);
+
+    // Event from workspace B's session
+    const eventFromB = {
+      type: "annotation.created",
+      sessionId: "session-beta",
+      payload: { id: "ann-beta", comment: "Beta bug" },
+    };
+
+    const acceptedB = provider.processSSEEvent(eventFromB, callback, "client-a");
+    expect(acceptedB).toBe(false);
     expect(receivedForA).toHaveLength(0);
 
-    // Event from Workspace A's session
-    simulatedHandler("session-alpha", { id: "ann-alpha", comment: "Alpha bug" });
+    // Event from workspace A's mapped session
+    const eventFromA = {
+      type: "annotation.created",
+      sessionId: "session-alpha",
+      payload: { id: "ann-alpha", comment: "Alpha bug" },
+    };
+
+    const acceptedA = provider.processSSEEvent(eventFromA, callback, "client-a");
+    expect(acceptedA).toBe(true);
     expect(receivedForA).toHaveLength(1);
-    expect(receivedForA[0]).toEqual({ id: "ann-alpha", comment: "Alpha bug" });
+    expect((receivedForA[0] as { id: string }).id).toBe("ann-alpha");
+  });
+
+  it("MCP ownership check rejects cross-workspace annotations and stale sessions", async () => {
+    const dbA = getDb(workspaceA);
+    dbSaveSessionMapping(dbA, "session-alpha", "client-a", workspaceA);
+
+    // 1. Local feedback belonging to Client A with mapped session-alpha
+    const fbA = VisualFeedbackSchema.parse({
+      id: "fb-alpha-001",
+      provider: "agentation",
+      providerAnnotationId: "ann-alpha-001",
+      clientId: "client-a",
+      sessionId: "session-alpha",
+      pageUrl: "http://localhost:3000",
+      comment: "Alpha issue",
+      createdAt: new Date().toISOString(),
+    });
+    dbSaveFeedback(dbA, fbA);
+
+    const authA = await checkAnnotationWorkspaceOwnership(workspaceA, "fb-alpha-001");
+    expect(authA.authorized).toBe(true);
+
+    // 2. Feedback belonging to another client (client-b) in workspace A
+    const fbB = VisualFeedbackSchema.parse({
+      id: "fb-beta-foreign",
+      provider: "agentation",
+      providerAnnotationId: "ann-foreign",
+      clientId: "client-b",
+      sessionId: "session-beta",
+      pageUrl: "http://localhost:4000",
+      comment: "Beta issue",
+      createdAt: new Date().toISOString(),
+    });
+    dbSaveFeedback(dbA, fbB);
+
+    const authForeign = await checkAnnotationWorkspaceOwnership(workspaceA, "fb-beta-foreign");
+    expect(authForeign.authorized).toBe(false);
+    expect(authForeign.reason).toContain('belongs to client "client-b"');
+
+    // 3. Feedback in client-a but with unmapped/stale session-gamma
+    const fbStale = VisualFeedbackSchema.parse({
+      id: "fb-stale-session",
+      provider: "agentation",
+      providerAnnotationId: "ann-stale",
+      clientId: "client-a",
+      sessionId: "session-gamma",
+      pageUrl: "http://localhost:3000",
+      comment: "Stale session issue",
+      createdAt: new Date().toISOString(),
+    });
+    dbSaveFeedback(dbA, fbStale);
+
+    const authStale = await checkAnnotationWorkspaceOwnership(workspaceA, "fb-stale-session");
+    expect(authStale.authorized).toBe(false);
+    expect(authStale.reason).toContain('session "session-gamma" is not mapped');
   });
 
   it("Idempotent imports preserve task links, status, and resolution summaries across re-imports", async () => {

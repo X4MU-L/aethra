@@ -273,8 +273,50 @@ export function planDesignDirections(
     return true;
   });
 
-  // If constraints eliminate all directions, gracefully fall back to base directions
-  const candidates = filtered.length > 0 ? filtered : directions;
+  // If constraints eliminate all candidate directions, explain the conflict rather than silently restoring prohibited directions
+  if (prohibitedWords.length > 0 && filtered.length === 0) {
+    return [];
+  }
+
+  const candidates = [...filtered];
+
+  // Derive task affinity signals to meaningfully bias ranking toward task requirements
+  const taskLower = taskDescription.toLowerCase();
+  const affinityScores = new Map<string, number>();
+
+  if (/\b(editorial|article|magazine|story|reading|blog)\b/.test(taskLower)) {
+    affinityScores.set("spacious-editorial", 2);
+    affinityScores.set("serif-authoritative", 2);
+  }
+  if (/\b(dashboard|admin|data|analytics|dense|table|metric)\b/.test(taskLower)) {
+    affinityScores.set("compact-information-dense", 2);
+    affinityScores.set("monospace-technical", 2);
+  }
+  if (/\b(ecommerce|shop|store|product|catalog|cart|checkout)\b/.test(taskLower)) {
+    affinityScores.set("hero-dominant", 2);
+    affinityScores.set("vibrant-energetic", 1);
+  }
+  if (/\b(minimal|clean|simple|focused)\b/.test(taskLower)) {
+    affinityScores.set("neutral-minimal", 2);
+    affinityScores.set("geometric-modern", 1);
+  }
+  if (/\b(warm|community|human|social|friendly)\b/.test(taskLower)) {
+    affinityScores.set("warm-approachable", 2);
+    affinityScores.set("humanist-warm", 2);
+  }
+
+  // Sort candidates by alignment to task affinity
+  candidates.sort((a, b) => {
+    let scoreA = 0;
+    let scoreB = 0;
+    for (const ax of a.axes) {
+      scoreA += affinityScores.get(ax.position) ?? 0;
+    }
+    for (const ax of b.axes) {
+      scoreB += affinityScores.get(ax.position) ?? 0;
+    }
+    return scoreB - scoreA;
+  });
 
   const enriched = candidates.map((dir, idx) => {
     const dominantVisual =
@@ -294,9 +336,20 @@ export function planDesignDirections(
         ? ` Aims to advance client outcomes: ${outcomes.slice(0, 2).join("; ")}.`
         : "";
 
+    const alignmentReasons: string[] = [];
+    for (const ax of dir.axes) {
+      if ((affinityScores.get(ax.position) ?? 0) > 0) {
+        alignmentReasons.push(`${ax.axis} (${ax.position})`);
+      }
+    }
+    const alignmentNote =
+      alignmentReasons.length > 0
+        ? ` Directly aligns with task requirements via ${alignmentReasons.join(", ")}.`
+        : "";
+
     return {
       ...dir,
-      rationale: `Explores a ${dominantVisual} composition with ${typoStyle} typography and a ${colorStyle} palette.${taskContext}${outcomeNote}`,
+      rationale: `Explores a ${dominantVisual} composition with ${typoStyle} typography and a ${colorStyle} palette.${taskContext}${alignmentNote}${outcomeNote}`,
       priority: idx + 1,
     };
   });

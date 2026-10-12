@@ -48,12 +48,17 @@ Key provisions:
 ## 3. Package Distribution Status
 
 ### `package.json` Configuration
-- `package.json` specifies `"private": true`.
-- Global npm installation instructions in README (`npm install -g aethra`) are development placeholders until private registry or public package publication is configured.
-- Recommended development usage:
+- `package.json` targets scoped GitHub Packages publication:
+  ```json
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  }
+  ```
+- Public npmjs.org global installation (`npm install -g aethra`) is not currently published; development instructions use local linking or GitHub Packages authentication:
   ```bash
   # Local linking for development:
   npm link
   # Or run via local binary:
-  ./bin/aethra.js <command>
+  ./dist/cli/index.js <command>
   ```
+- Because `agentation-mcp` is currently listed under `dependencies`, package distribution carries the PolyForm Shield 1.0.0 perimeter. Prior to public un-scoped commercial release, `agentation-mcp` should be moved to `optionalDependencies` or extracted into an independent plugin adapter.

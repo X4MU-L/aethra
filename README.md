@@ -183,7 +183,13 @@ cd /path/to/client-project
 npm install agentation -D
 ```
 
-2. Add to the app root (development only):
+2. Generate the toolbar configuration for your client workspace:
+
+```bash
+aethra feedback setup-toolbar --client <client-slug>
+```
+
+3. Add the toolbar component to the app root (development only) with the explicit `sessionId`:
 
 ```jsx
 import { Agentation } from "agentation";
@@ -193,23 +199,32 @@ function App() {
     <>
       <YourApp />
       {process.env.NODE_ENV === "development" && (
-        <Agentation endpoint="http://localhost:4747" />
+        <Agentation 
+          endpoint="http://localhost:4747"
+          sessionId="<mapped-session-id>"
+          // Or if letting Agentation create sessions dynamically, register it:
+          // onSessionCreated={(session) => {
+          //   // Register in Aethra: aethra feedback register-session <session.id>
+          // }}
+        />
       )}
     </>
   );
 }
 ```
 
-3. The Agentation HTTP server starts automatically when:
+> **Session Identity Handshake**: Explicitly passing `sessionId` guarantees that browser annotations and Aethra watcher/MCP ingestion are bound to the identical session, preventing unmapped annotations or cross-workspace leakage.
+
+4. The Agentation HTTP server starts automatically when:
    - The agent calls any `aethra_*_annotation*` MCP tool, OR
    - You run `aethra feedback watch --provider agentation`
 
-4. Click elements in the browser, add comments. The agent receives them through MCP.
+5. Click elements in the browser, add comments. The agent receives them through MCP or live SSE.
 
 ### How it works under the hood
 
 ```
-Browser (React app with <Agentation /> toolbar)
+Browser (React app with <Agentation sessionId="..." /> toolbar)
     │
     │ User clicks element, adds comment
     │
@@ -219,7 +234,7 @@ Agentation HTTP server (port 4747, started by Aethra)
     │ Stores in ~/.agentation/store.db
     │
     ▼
-Aethra MCP server (proxies Agentation tools)
+Aethra MCP server / SSE Bridge (Strict session & workspace authorization)
     │
     │ Agent calls aethra_get_pending_annotations
     │ or aethra_watch_annotations
@@ -241,15 +256,19 @@ Agentation HTTP server
 Browser toolbar shows ✓ resolved
 ```
 
-### Non-React projects
+### Non-React projects & Manual Feedback
 
-For WordPress, Shopify, or other platforms, use the manual feedback provider:
+For WordPress, Shopify, or other platforms, or for manual entry without a toolbar:
 
 ```bash
+# Add manual feedback directly via CLI:
+aethra feedback add "Header navigation overflows on 375px screens" --selector ".site-header nav" --url "http://localhost:3000"
+
+# Or watch workspace feedback/items/*.json files:
 aethra feedback watch --provider manual
 ```
 
-Create feedback as JSON files in `feedback/items/`, or use the REST API at `localhost:4747` with a browser extension or bookmarklet.
+Feedback can be added via CLI or by placing JSON files matching `VisualFeedback` format in `feedback/items/*.json`.
 
 ## Design intelligence
 

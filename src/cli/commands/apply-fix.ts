@@ -286,12 +286,18 @@ export function registerApplyFixCommand(program: Command): void {
           classification.classification,
           config.platform,
         );
-        const unavailable = capabilities.filter(
+        const liveCapabilities = await Promise.all(
+          capabilities.map(async (c) => ({
+            entry: c,
+            status: await c.availabilityCheck(),
+          })),
+        );
+        const unavailable = liveCapabilities.filter(
           (c) => c.status === "unavailable" || c.status === "requires-setup",
         );
         if (unavailable.length > 0) {
           logger.warn(
-            `Capabilities requiring setup: ${unavailable.map((c) => c.name).join(", ")}`,
+            `Capabilities requiring setup: ${unavailable.map((c) => `${c.entry.name} (${c.status})`).join(", ")}`,
           );
         }
 

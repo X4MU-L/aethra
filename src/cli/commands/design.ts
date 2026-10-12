@@ -20,6 +20,7 @@ import {
 import { evaluateDesign, saveCritique } from "../../design/critic.js";
 import { readJson, pathExists } from "../../engine/fs.js";
 import { loadClientFacts } from "../../engine/workspace.js";
+import { findTaskByPrefix } from "../../engine/tasks.js";
 import { logger } from "../../core/logger.js";
 import { toAethraError } from "../../core/errors.js";
 import type { DesignDirection } from "../../core/schemas.js";
@@ -80,8 +81,21 @@ export function registerDesignCommand(program: Command): void {
     .action(async (task: string, opts, cmd) => {
       const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
       const count = parseInt(opts.count, 10);
-      const seed =
-        opts.seed !== undefined ? parseInt(opts.seed, 10) : undefined;
+      if (isNaN(count) || count < 1 || count > 50) {
+        logger.error(
+          `Count must be an integer between 1 and 50 (received "${opts.count}")`,
+        );
+        process.exit(1);
+      }
+
+      let seed: number | undefined;
+      if (opts.seed !== undefined) {
+        seed = parseInt(opts.seed, 10);
+        if (isNaN(seed)) {
+          logger.error(`Seed must be an integer (received "${opts.seed}")`);
+          process.exit(1);
+        }
+      }
 
       try {
         // Load client facts if available
@@ -107,8 +121,20 @@ export function registerDesignCommand(program: Command): void {
 
         const directions = planDesignDirections(task, clientFacts, count, seed);
 
+        if (directions.length === 0) {
+          console.log(
+            chalk.yellow(
+              `\n  ⚠ No design directions could be generated for "${task}".\n` +
+                "    All candidates were eliminated due to prohibitive client constraints.\n",
+            ),
+          );
+          return;
+        }
+
         console.log(
-          chalk.bold.blue(`\n  Design Directions — ${count} generated\n`),
+          chalk.bold.blue(
+            `\n  Design Directions — ${directions.length} generated\n`,
+          ),
         );
         console.log(chalk.gray(`  Task: ${task}`));
         if (seed !== undefined) console.log(chalk.gray(`  Seed: ${seed}`));
@@ -239,6 +265,7 @@ export function registerDesignCommand(program: Command): void {
     .description(
       "Run the design critic against a task's design brief and screenshots",
     )
+    .option("--run <run-id>", "Specific audit run ID to pull screenshots from")
     .option("--client <slug>", "Specify client by slug")
     .action(async (taskId: string, opts, cmd) => {
       const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
@@ -253,6 +280,17 @@ export function registerDesignCommand(program: Command): void {
 
         const { workspacePath } = await resolveClientWorkspace(clientSlug);
 
+        // Fetch task description and title if available
+        let taskDescription = `Task ${taskId}`;
+        try {
+          const taskRecord = await findTaskByPrefix(workspacePath, taskId);
+          if (taskRecord) {
+            taskDescription = `${taskRecord.title}${taskRecord.notes ? `: ${taskRecord.notes}` : ""}`;
+          }
+        } catch {
+          // Fall back to taskId string
+        }
+
         // Load design brief
         const brief = await loadDesignBrief(workspacePath, taskId);
         if (!brief) {
@@ -261,7 +299,7 @@ export function registerDesignCommand(program: Command): void {
           );
         }
 
-        // Look for screenshots (check both root and run-specific subdirectories)
+        // Look for screenshots with explicit run provenance
         const screenshotsDir = path.join(
           workspacePath,
           "evidence",
@@ -270,16 +308,60 @@ export function registerDesignCommand(program: Command): void {
         const screenshotPaths: string[] = [];
         if (await pathExists(screenshotsDir)) {
           const { promises: fs } = await import("fs");
-          const entries = await fs.readdir(screenshotsDir, { withFileTypes: true });
-          for (const entry of entries) {
-            const fullPath = path.join(screenshotsDir, entry.name);
-            if (entry.isFile() && /\.(png|jpg|jpeg|webp)$/i.test(entry.name)) {
-              screenshotPaths.push(fullPath);
-            } else if (entry.isDirectory()) {
-              const subEntries = await fs.readdir(fullPath);
-              for (const sub of subEntries) {
-                if (/\.(png|jpg|jpeg|webp)$/i.test(sub)) {
-                  screenshotPaths.push(path.join(fullPath, sub));
+
+          if (opts.run) {
+            const runName = opts.run.startsWith("run-")
+              ? opts.run
+              : `run-${opts.run}`;
+            const runDir = path.join(screenshotsDir, runName);
+            if (await pathExists(runDir)) {
+              const files = await fs.readdir(runDir);
+              for (const f of files) {
+                if (/\.(png|jpg|jpeg|webp)$/i.test(f)) {
+                  screenshotPaths.push(path.join(runDir, f));
+                }
+              }
+              logger.info(`Using screenshots from specified run: ${runName}`);
+            } else {
+              logger.warn(`Screenshot directory for run not found: ${runDir}`);
+            }
+          } else {
+            // Find latest run subdirectory by modified time to avoid mixing historical audits
+            const entries = await fs.readdir(screenshotsDir, {
+              withFileTypes: true,
+            });
+            const subdirs = entries.filter((e) => e.isDirectory());
+            if (subdirs.length > 0) {
+              const dirStats = await Promise.all(
+                subdirs.map(async (d) => {
+                  const s = await fs.stat(path.join(screenshotsDir, d.name));
+                  return { name: d.name, mtime: s.mtimeMs };
+                }),
+              );
+              dirStats.sort((a, b) => b.mtime - a.mtime);
+              const latestRunDir = path.join(
+                screenshotsDir,
+                dirStats[0]!.name,
+              );
+              const files = await fs.readdir(latestRunDir);
+              for (const f of files) {
+                if (/\.(png|jpg|jpeg|webp)$/i.test(f)) {
+                  screenshotPaths.push(path.join(latestRunDir, f));
+                }
+              }
+              logger.info(
+                `Using screenshots from latest audit run: ${dirStats[0]!.name}`,
+              );
+            }
+
+            // Fallback: check root screenshots dir
+            if (screenshotPaths.length === 0) {
+              for (const entry of entries) {
+                if (
+                  entry.isFile() &&
+                  /\.(png|jpg|jpeg|webp)$/i.test(entry.name)
+                ) {
+                  screenshotPaths.push(path.join(screenshotsDir, entry.name));
                 }
               }
             }
@@ -299,12 +381,13 @@ export function registerDesignCommand(program: Command): void {
 
         console.log(chalk.bold.blue(`\n  Design Critique — ${taskId}\n`));
         console.log(chalk.gray(`  Screenshots: ${screenshotPaths.length}`));
-        console.log(chalk.gray(`  Brief: ${brief ? brief.id : "none"}\n`));
+        console.log(chalk.gray(`  Brief: ${brief ? brief.id : "none"}`));
+        console.log(chalk.gray(`  Task: ${taskDescription}\n`));
 
         const critique = await evaluateDesign({
           screenshotPaths,
           designBrief: brief ?? undefined,
-          taskDescription: `Task ${taskId}`,
+          taskDescription,
         });
 
         // Set taskId for persistence and lookup
@@ -313,45 +396,45 @@ export function registerDesignCommand(program: Command): void {
         // Save critique
         const saved = await saveCritique(workspacePath, critique);
 
-        // Show review status
-        if (critique.reviewStatus === "pending") {
+        // Show review status and scores honestly
+        if (critique.reviewStatus === "pending" || critique.overallScore == null) {
           console.log(
             chalk.yellow(
-              "  Status: Pending review (model integration pending)\n",
+              "  Status: Pending review (manual / multimodal review required)\n",
             ),
           );
           console.log(
             chalk.gray(
-              "  A critique prompt has been generated. Feed it to a visual model\n" +
-                "  or review the screenshots manually against the design brief.\n",
+              "  Evaluation has not been performed by an automated multimodal model.\n" +
+                "  No numeric scores are assigned. A critique prompt has been generated for external evaluation.\n",
             ),
           );
-        }
-
-        // Print scores
-        console.log(chalk.bold("  Scores:\n"));
-        for (const score of critique.scores) {
-          const bar =
-            score.score > 0
-              ? chalk.green("|".repeat(score.score)) +
-                chalk.gray("|".repeat(10 - score.score))
-              : chalk.gray("|".repeat(10));
-          console.log(
-            `    ${score.dimension.padEnd(24)} ${bar}  ${score.score}/10`,
-          );
-          if (
-            score.observation !== "Not yet evaluated — pending review" &&
-            score.observation !== "Manual review required"
-          ) {
+        } else {
+          console.log(chalk.bold("  Scores:\n"));
+          for (const score of critique.scores) {
+            const sc = score.score ?? 0;
+            const bar =
+              sc > 0
+                ? chalk.green("|".repeat(sc)) +
+                  chalk.gray("|".repeat(10 - sc))
+                : chalk.gray("|".repeat(10));
             console.log(
-              chalk.gray(`    ${"".padEnd(24)} ${score.observation}`),
+              `    ${score.dimension.padEnd(24)} ${bar}  ${sc}/10`,
             );
+            if (
+              score.observation !== "Not yet evaluated — pending review" &&
+              score.observation !== "Manual review required"
+            ) {
+              console.log(
+                chalk.gray(`    ${"".padEnd(24)} ${score.observation}`),
+              );
+            }
           }
-        }
 
-        console.log(
-          `\n  Overall: ${chalk.bold(String(critique.overallScore))}/10`,
-        );
+          console.log(
+            `\n  Overall: ${chalk.bold(String(critique.overallScore))}/10`,
+          );
+        }
         console.log(`  Summary: ${chalk.gray(critique.summary)}`);
 
         if (critique.improvements.length > 0) {

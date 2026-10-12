@@ -76,21 +76,27 @@ function resolveWorkspacePath(): string {
     // Fall through
   }
 
+  if (process.env.VITEST || process.env.NODE_ENV === "test") {
+    return process.cwd();
+  }
+
   process.stderr.write(
     "Error: workspace path required. Use --workspace <path> or set AETHRA_WORKSPACE.\n",
   );
   process.exit(1);
 }
 
-const workspacePath = resolveWorkspacePath();
+let workspacePath = resolveWorkspacePath();
 
 // Validate workspace upfront
 const configCheckPath = path.join(workspacePath, "client.yaml");
 if (!fs.pathExistsSync(configCheckPath)) {
-  process.stderr.write(
-    `Error: ${workspacePath} is not a valid Aethra workspace (no client.yaml found).\n`,
-  );
-  process.exit(1);
+  if (!process.env.VITEST && process.env.NODE_ENV !== "test") {
+    process.stderr.write(
+      `Error: ${workspacePath} is not a valid Aethra workspace (no client.yaml found).\n`,
+    );
+    process.exit(1);
+  }
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -1014,13 +1020,23 @@ async function verifyAnnotationWorkspaceOwnership(
     dbLoadFeedback(db, annotationId);
 
   if (localFb) {
-    if (localFb.clientId === clientSlug) {
-      return { authorized: true };
+    if (localFb.clientId !== clientSlug) {
+      return {
+        authorized: false,
+        reason: `Annotation belongs to client "${localFb.clientId}", not current workspace client "${clientSlug}"`,
+      };
     }
-    return {
-      authorized: false,
-      reason: `Annotation belongs to client "${localFb.clientId}", not current workspace client "${clientSlug}"`,
-    };
+    // Verify that stored session belongs to current workspace's mapped sessions
+    if (
+      localFb.sessionId &&
+      (mappedSessions.length === 0 || !mappedSessions.includes(localFb.sessionId))
+    ) {
+      return {
+        authorized: false,
+        reason: `Annotation session "${localFb.sessionId}" is not mapped to workspace "${clientSlug}"`,
+      };
+    }
+    return { authorized: true };
   }
 
   // 2. Not in local DB — check upstream annotation's session
@@ -1047,6 +1063,20 @@ async function verifyAnnotationWorkspaceOwnership(
       authorized: false,
       reason: `Failed to verify annotation session ownership: ${(err as Error).message}`,
     };
+  }
+}
+
+/** Exported for integration and security regression tests. */
+export async function checkAnnotationWorkspaceOwnership(
+  targetWorkspacePath: string,
+  annotationId: string,
+): Promise<{ authorized: boolean; reason?: string }> {
+  const prevWp = workspacePath;
+  try {
+    workspacePath = targetWorkspacePath;
+    return await verifyAnnotationWorkspaceOwnership(annotationId);
+  } finally {
+    workspacePath = prevWp;
   }
 }
 
@@ -1668,7 +1698,9 @@ async function main() {
   // Server is now listening on stdio — no console.log (would corrupt the stream)
 }
 
-main().catch((err) => {
-  process.stderr.write(`Fatal: ${(err as Error).message}\n`);
-  process.exit(1);
-});
+if (!process.env.VITEST && process.env.NODE_ENV !== "test") {
+  main().catch((err) => {
+    process.stderr.write(`Fatal: ${(err as Error).message}\n`);
+    process.exit(1);
+  });
+}

@@ -631,7 +631,7 @@ export type DesignBrief = z.infer<typeof DesignBriefSchema>;
 
 export const CritiqueScoreSchema = z.object({
   dimension: z.string(),
-  score: z.number().min(0).max(10),
+  score: z.number().min(0).max(10).nullable().optional(),
   observation: z.string(),
   suggestion: z.string(),
 });
@@ -646,7 +646,7 @@ export const CritiqueResultSchema = z.object({
   briefId: z.string().optional(),
   screenshotPaths: z.array(z.string()).default([]),
   scores: z.array(CritiqueScoreSchema).default([]),
-  overallScore: z.number().min(0).max(10),
+  overallScore: z.number().min(0).max(10).nullable().optional(),
   summary: z.string(),
   strengths: z.array(z.string()).default([]),
   improvements: z.array(z.string()).default([]),

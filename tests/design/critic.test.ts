@@ -97,7 +97,7 @@ describe("evaluateDesign", () => {
     expect(typeof result.id).toBe("string");
     expect(result.scores).toBeInstanceOf(Array);
     expect(result.scores.length).toBeGreaterThan(0);
-    expect(typeof result.overallScore).toBe("number");
+    expect(result.overallScore).toBeNull();
     expect(typeof result.summary).toBe("string");
     expect(result.strengths).toBeInstanceOf(Array);
     expect(result.improvements).toBeInstanceOf(Array);
@@ -106,17 +106,17 @@ describe("evaluateDesign", () => {
     expect(result.createdAt).toBeTruthy();
   });
 
-  it("stub returns score 0 with pending review status", async () => {
+  it("unevaluated stub returns null score with pending review status", async () => {
     const result = await evaluateDesign({
       screenshotPaths: ["test.png"],
       taskDescription: "Test evaluation",
     });
 
-    expect(result.overallScore).toBe(0);
+    expect(result.overallScore).toBeNull();
     expect(result.reviewStatus).toBe("pending");
     for (const score of result.scores) {
-      expect(score.score).toBe(0);
-      expect(score.observation).toContain("Not yet evaluated");
+      expect(score.score).toBeNull();
+      expect(score.observation).toContain("manual or multimodal review required");
     }
   });
 
@@ -150,7 +150,7 @@ describe("evaluateDesign", () => {
 
     for (const score of result.scores) {
       expect(typeof score.dimension).toBe("string");
-      expect(typeof score.score).toBe("number");
+      expect(score.score === null || typeof score.score === "number").toBe(true);
       expect(typeof score.observation).toBe("string");
       expect(typeof score.suggestion).toBe("string");
     }

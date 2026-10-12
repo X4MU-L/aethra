@@ -6,6 +6,7 @@ import { describe, it, expect } from "vitest";
 import {
   generateDesignDirections,
   hammingDistance,
+  planDesignDirections,
 } from "../../src/design/direction-planner.js";
 
 describe("generateDesignDirections", () => {
@@ -83,5 +84,56 @@ describe("hammingDistance", () => {
   it("returns correct distance for different arrays", () => {
     expect(hammingDistance(["a", "b", "c"], ["a", "x", "c"])).toBe(1);
     expect(hammingDistance(["a", "b", "c"], ["x", "y", "z"])).toBe(3);
+  });
+});
+
+describe("planDesignDirections task affinity and constraint enforcement", () => {
+  it("biases candidate ranking towards task domain keywords", () => {
+    const directions = planDesignDirections(
+      "Create an editorial magazine article reading experience",
+      undefined,
+      4,
+      42,
+    );
+
+    expect(directions.length).toBeGreaterThan(0);
+    const topDirection = directions[0]!;
+    // Top direction should have affinity rationale note
+    expect(topDirection.rationale).toContain("Directly aligns with task requirements");
+  });
+
+  it("filters out candidates that violate prohibitive constraints", () => {
+    const directions = planDesignDirections(
+      "Standard redesign",
+      { constraints: ["avoid serif typography", "do not use vibrant colors"] },
+      4,
+      42,
+    );
+
+    for (const dir of directions) {
+      const typo = dir.axes.find((a) => a.axis === "typography-character")?.position;
+      const color = dir.axes.find((a) => a.axis === "color-temperature")?.position;
+      expect(typo).not.toBe("serif-authoritative");
+      expect(color).not.toBe("vibrant-energetic");
+    }
+  });
+
+  it("returns empty array when all candidates violate constraints without silent fallback", () => {
+    // Prohibit every possible layout density, forcing all candidates to be disqualified
+    const directions = planDesignDirections(
+      "Impossible redesign",
+      {
+        constraints: [
+          "avoid spacious layouts",
+          "avoid balanced layouts",
+          "avoid compact layouts",
+        ],
+      },
+      4,
+      42,
+    );
+
+    // Must not silently fall back to prohibited directions
+    expect(directions).toEqual([]);
   });
 });

@@ -19,6 +19,12 @@ import {
 import { getProvider } from "../../visual-feedback/providers/registry.js";
 import { logger } from "../../core/logger.js";
 import { toAethraError } from "../../core/errors.js";
+import {
+  getDb,
+  dbGetSessionsForClient,
+  dbSaveSessionMapping,
+  dbFindFeedbackByProviderAnnotation,
+} from "../../engine/db.js";
 
 const STATUS_ICON: Record<string, string> = {
   pending: chalk.yellow("?"),
@@ -465,7 +471,7 @@ export function registerFeedbackCommand(program: Command): void {
       const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
 
       try {
-        const { config } = await resolveClientWorkspace(clientSlug);
+        const { config, workspacePath } = await resolveClientWorkspace(clientSlug);
         const port = parseInt(opts.port, 10);
 
         console.log(
@@ -492,6 +498,16 @@ export function registerFeedbackCommand(program: Command): void {
             ),
           );
           return;
+        }
+
+        // Resolve or create explicit session mapping
+        const db = getDb(workspacePath);
+        const existingSessions = dbGetSessionsForClient(db, config.slug);
+        let activeSessionId = existingSessions[0];
+        if (!activeSessionId) {
+          const crypto = await import("crypto");
+          activeSessionId = crypto.randomBytes(8).toString("hex");
+          dbSaveSessionMapping(db, activeSessionId, config.slug, workspacePath);
         }
 
         // Check if repository path is configured
@@ -539,12 +555,12 @@ export function registerFeedbackCommand(program: Command): void {
 
         console.log(
           chalk.cyan(
-            `  ${alreadyInstalled ? "1" : "2"}. Add the toolbar to your app root (development only):\n`,
+            `  ${alreadyInstalled ? "1" : "2"}. Add the toolbar to your app root with the client's mapped sessionId:\n`,
           ),
         );
         console.log(
           chalk.gray(
-            `     import { Agentation } from "agentation";\n\n     function App() {\n       return (\n         <>\n           <YourApp />\n           {process.env.NODE_ENV === "development" && (\n             <Agentation endpoint="http://localhost:${port}" />\n           )}\n         </>\n       );\n     }\n`,
+            `     import { Agentation } from "agentation";\n\n     function App() {\n       return (\n         <>\n           <YourApp />\n           {process.env.NODE_ENV === "development" && (\n             <Agentation\n               endpoint="http://localhost:${port}"\n               sessionId="${activeSessionId}"\n             />\n           )}\n         </>\n       );\n     }\n`,
           ),
         );
 
@@ -565,6 +581,13 @@ export function registerFeedbackCommand(program: Command): void {
           ),
         );
 
+        console.log(chalk.bold("  Alternative dynamic session registration:\n"));
+        console.log(
+          chalk.gray(
+            `  If your toolbar initializes its own session via onSessionCreated, register it using:\n    aethra feedback register-session <session-id> --client ${config.slug}\n`,
+          ),
+        );
+
         console.log(chalk.bold("  Important:\n"));
         console.log(
           chalk.gray(
@@ -580,6 +603,33 @@ export function registerFeedbackCommand(program: Command): void {
       } catch (err) {
         const e = toAethraError(err);
         logger.error(`setup-toolbar failed: ${e.message}`);
+        process.exit(e.exitCode);
+      }
+    });
+
+  feedback
+    .command("register-session <session-id>")
+    .description(
+      "Register an active toolbar session with the client workspace",
+    )
+    .option("--client <slug>", "Specify client by slug")
+    .action(async (sessionId: string, opts, cmd) => {
+      const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
+
+      try {
+        const { config, workspacePath } =
+          await resolveClientWorkspace(clientSlug);
+        const db = getDb(workspacePath);
+        dbSaveSessionMapping(db, sessionId, config.slug, workspacePath);
+
+        console.log(
+          chalk.green(
+            `\n  ✓ Registered session "${sessionId}" for client "${config.name}".\n`,
+          ),
+        );
+      } catch (err) {
+        const e = toAethraError(err);
+        logger.error(`register-session failed: ${e.message}`);
         process.exit(e.exitCode);
       }
     });
@@ -632,8 +682,9 @@ export function registerFeedbackCommand(program: Command): void {
             startServer: (port: number) => Promise<void>;
             stopServer: () => Promise<void>;
             subscribeToEvents: (
-              cb: (ann: Record<string, unknown>) => void,
+              cb: (ann: Record<string, unknown>) => void | Promise<void>,
               clientSlug?: string,
+              sessionId?: string,
             ) => Promise<void>;
           };
 
@@ -699,6 +750,11 @@ export function registerFeedbackCommand(program: Command): void {
 
           const activeSessionId = sessionResult.sessionId ?? proposedSessionId;
           console.log(chalk.gray(`  Session: ${activeSessionId} → ${pageUrl}`));
+          console.log(
+            chalk.cyan(
+              `  Toolbar connection: <Agentation endpoint="http://localhost:${port}" sessionId="${activeSessionId}" />\n`,
+            ),
+          );
 
           const spinner = ora({
             text: "Listening for annotations (real-time + polling fallback)...",
@@ -722,32 +778,45 @@ export function registerFeedbackCommand(program: Command): void {
           process.on("SIGTERM", shutdown);
 
           // Subscribe to SSE events for real-time annotations with workspace isolation
-          await agProvider.subscribeToEvents((rawAnnotation) => {
+          await agProvider.subscribeToEvents(async (rawAnnotation) => {
             try {
               const feedback = provider.normalize(
                 rawAnnotation as { id: string; [key: string]: unknown },
                 slug,
               );
-              saveFeedback(workspacePath, feedback).catch(() => {});
-              totalImported++;
-              spinner.stop();
-              console.log(
-                chalk.green(
-                  `  +1 annotation (real-time) — total: ${totalImported}`,
-                ),
-              );
-              console.log(
-                chalk.gray(
-                  `    ${feedback.id.slice(0, 8)}  ${feedback.comment.slice(0, 60)}`,
-                ),
-              );
-              spinner.start(
-                "Listening for annotations (real-time + polling fallback)...",
-              );
+              const db = getDb(workspacePath);
+              const existing = feedback.providerAnnotationId
+                ? dbFindFeedbackByProviderAnnotation(
+                    db,
+                    feedback.provider,
+                    feedback.providerAnnotationId,
+                    feedback.clientId,
+                  )
+                : null;
+
+              await saveFeedback(workspacePath, feedback);
+
+              if (!existing) {
+                totalImported++;
+                spinner.stop();
+                console.log(
+                  chalk.green(
+                    `  +1 annotation (real-time) — total new: ${totalImported}`,
+                  ),
+                );
+                console.log(
+                  chalk.gray(
+                    `    ${feedback.id.slice(0, 8)}  ${feedback.comment.slice(0, 60)}`,
+                  ),
+                );
+                spinner.start(
+                  "Listening for annotations (real-time + polling fallback)...",
+                );
+              }
             } catch (err) {
               logger.warn(`SSE annotation error: ${(err as Error).message}`);
             }
-          }, slug);
+          }, slug, activeSessionId);
 
           // Slower polling loop as safety net
           const fallbackIntervalMs = Math.max(intervalMs, 30000);
@@ -766,15 +835,15 @@ export function registerFeedbackCommand(program: Command): void {
                 providerName,
               );
 
-              if (result.imported.length > 0) {
-                totalImported += result.imported.length;
+              if (result.newCount > 0) {
+                totalImported += result.newCount;
                 spinner.stop();
                 console.log(
                   chalk.green(
-                    `  +${result.imported.length} item(s) via poll (total: ${totalImported})`,
+                    `  +${result.newCount} new item(s) via poll (total new: ${totalImported})`,
                   ),
                 );
-                for (const item of result.imported) {
+                for (const item of result.imported.slice(0, result.newCount)) {
                   console.log(
                     chalk.gray(
                       `    ${item.id.slice(0, 8)}  ${item.comment.slice(0, 60)}`,

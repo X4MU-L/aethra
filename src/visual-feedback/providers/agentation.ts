@@ -650,11 +650,63 @@ export class AgentationProvider extends VisualFeedbackProvider {
     }
   }
 
+  /**
+   * Process a parsed SSE event or raw line, enforcing fail-closed client workspace isolation.
+   * Returns true if event was authorized and dispatched to callback, false if rejected/dropped.
+   */
+  processSSEEvent(
+    event: Record<string, unknown>,
+    callback: (annotation: RawAnnotation) => void,
+    clientSlug?: string,
+  ): boolean {
+    if (
+      event.type !== "annotation.created" ||
+      (!event.payload && !event.annotation)
+    ) {
+      return false;
+    }
+
+    const ann = (event.payload ?? event.annotation) as RawAnnotation;
+    const evSessionId =
+      event.sessionId ?? ann.sessionId ?? ann._sessionId;
+
+    // Strict fail-closed isolation when clientSlug is provided:
+    if (clientSlug) {
+      if (!evSessionId) {
+        logger.warn(
+          `Agentation SSE: rejected event without sessionId for client "${clientSlug}" (fail-closed isolation)`,
+        );
+        return false;
+      }
+
+      if (this.workspacePath) {
+        const db = getDb(this.workspacePath);
+        if (!dbIsSessionMapped(db, String(evSessionId), clientSlug)) {
+          logger.debug(
+            `Agentation SSE: ignored annotation from session ${evSessionId} (not mapped to client "${clientSlug}")`,
+          );
+          return false;
+        }
+      }
+    }
+
+    callback({
+      ...ann,
+      _sessionId: evSessionId ? String(evSessionId) : undefined,
+    });
+    return true;
+  }
+
   async subscribeToEvents(
     callback: (annotation: RawAnnotation) => void,
     clientSlug?: string,
+    sessionId?: string,
   ): Promise<void> {
     this.sseAbort = new AbortController();
+
+    const streamUrl = sessionId
+      ? `${this.baseUrl}/sessions/${sessionId}/events?agent=true`
+      : `${this.baseUrl}/events?agent=true`;
 
     const runLoop = async () => {
       let backoffMs = 1000;
@@ -662,7 +714,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
 
       while (!this.sseAbort!.signal.aborted) {
         try {
-          const res = await fetch(`${this.baseUrl}/events?agent=true`, {
+          const res = await fetch(streamUrl, {
             headers: { Accept: "text/event-stream" },
             signal: this.sseAbort!.signal,
           });
@@ -678,7 +730,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
 
           // Connected — reset backoff
           backoffMs = 1000;
-          logger.info("Agentation: subscribed to SSE events");
+          logger.info(`Agentation: subscribed to SSE events (${sessionId ? `session ${sessionId}` : "global"})`);
 
           const reader = res.body.getReader();
           const decoder = new TextDecoder();
@@ -696,32 +748,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
               if (line.startsWith("data: ")) {
                 try {
                   const event = JSON.parse(line.slice(6));
-                  if (
-                    event.type === "annotation.created" &&
-                    (event.payload || event.annotation)
-                  ) {
-                    const ann = (event.payload ?? event.annotation) as RawAnnotation;
-                    const evSessionId =
-                      event.sessionId ?? ann.sessionId ?? ann._sessionId;
-
-                    // Enforce workspace/client isolation
-                    if (clientSlug && this.workspacePath && evSessionId) {
-                      const db = getDb(this.workspacePath);
-                      if (
-                        !dbIsSessionMapped(db, String(evSessionId), clientSlug)
-                      ) {
-                        logger.debug(
-                          `Agentation SSE: ignored annotation from session ${evSessionId} (not mapped to client "${clientSlug}")`,
-                        );
-                        continue;
-                      }
-                    }
-
-                    callback({
-                      ...ann,
-                      _sessionId: evSessionId ? String(evSessionId) : undefined,
-                    });
-                  }
+                  this.processSSEEvent(event, callback, clientSlug);
                 } catch {
                   // Skip malformed SSE data
                 }

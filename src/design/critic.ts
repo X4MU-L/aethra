@@ -104,11 +104,11 @@ export async function evaluateDesign(input: {
     screenshotPaths: input.screenshotPaths,
     scores: CRITIQUE_DIMENSIONS.map((dim) => ({
       dimension: dim,
-      score: 0,
-      observation: "Not yet evaluated — pending review",
+      score: null,
+      observation: "Not yet evaluated — manual or multimodal review required",
       suggestion: "Evaluate this dimension during design review",
     })),
-    overallScore: 0,
+    overallScore: null,
     summary:
       "Design critique pending review. Prompt generated for external model evaluation.",
     strengths: [],
