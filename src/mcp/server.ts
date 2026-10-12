@@ -1151,6 +1151,20 @@ export async function testHandleGetPendingAnnotations(
   }
 }
 
+/** Exported for MCP watch observability tests. */
+export async function testHandleWatchAnnotations(
+  targetWorkspacePath: string,
+  timeoutSeconds?: number,
+) {
+  const prevWp = workspacePath;
+  try {
+    workspacePath = targetWorkspacePath;
+    return await handleWatchAnnotations(timeoutSeconds);
+  } finally {
+    workspacePath = prevWp;
+  }
+}
+
 export interface ScopedPendingResult {
   annotations: unknown[];
   successSessions: string[];
@@ -1183,12 +1197,34 @@ async function fetchScopedPendingAnnotations(): Promise<ScopedPendingResult> {
         });
         continue;
       }
-      const data = await res.json();
-      const annotations = Array.isArray(data)
-        ? data
-        : Array.isArray((data as { annotations?: unknown[] })?.annotations)
-          ? (data as { annotations: unknown[] }).annotations
-          : [];
+      let data: unknown;
+      try {
+        data = await res.json();
+      } catch (parseErr) {
+        failedSessions.push({
+          sessionId,
+          error: `Malformed JSON response: ${(parseErr as Error).message}`,
+        });
+        continue;
+      }
+
+      let annotations: unknown[];
+      if (Array.isArray(data)) {
+        annotations = data;
+      } else if (
+        data !== null &&
+        typeof data === "object" &&
+        Array.isArray((data as { annotations?: unknown[] }).annotations)
+      ) {
+        annotations = (data as { annotations: unknown[] }).annotations;
+      } else {
+        failedSessions.push({
+          sessionId,
+          error:
+            "Malformed upstream response schema: expected array or object with annotations array",
+        });
+        continue;
+      }
 
       successSessions.push(sessionId);
 
@@ -1355,15 +1391,36 @@ async function handleWatchAnnotations(timeoutSeconds?: number) {
             );
             continue;
           }
+          let data: unknown;
+          try {
+            data = await res.json();
+          } catch (parseErr) {
+            sessionErrors.set(
+              sessionId,
+              `Malformed JSON response: ${(parseErr as Error).message}`,
+            );
+            continue;
+          }
+
+          let annotations: unknown[];
+          if (Array.isArray(data)) {
+            annotations = data;
+          } else if (
+            data !== null &&
+            typeof data === "object" &&
+            Array.isArray((data as { annotations?: unknown[] }).annotations)
+          ) {
+            annotations = (data as { annotations: unknown[] }).annotations;
+          } else {
+            sessionErrors.set(
+              sessionId,
+              "Malformed upstream response schema: expected array or object with annotations array",
+            );
+            continue;
+          }
+
           successfulSessions.add(sessionId);
           sessionErrors.delete(sessionId);
-
-          const data = await res.json();
-          const annotations = Array.isArray(data)
-            ? data
-            : Array.isArray((data as { annotations?: unknown[] })?.annotations)
-              ? (data as { annotations: unknown[] }).annotations
-              : [];
 
           for (const rawAnn of annotations) {
             const ann = rawAnn as Record<string, unknown>;

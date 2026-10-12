@@ -475,6 +475,7 @@ export function registerFeedbackCommand(program: Command): void {
     )
     .option("--client <slug>", "Specify client by slug")
     .option("--port <port>", "Agentation server port", "4747")
+    .option("--session <id>", "Specific session ID to verify and configure")
     .action(async (opts, cmd) => {
       const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
 
@@ -510,8 +511,74 @@ export function registerFeedbackCommand(program: Command): void {
 
         // Resolve explicit session mapping if one already exists
         const db = getDb(workspacePath);
-        const existingSessions = dbGetSessionsForClient(db, config.slug);
-        const activeSessionId = existingSessions[0];
+        let activeSessionId: string | null = null;
+        let sessionNote: string | null = null;
+
+        const agProvider = getProvider("agentation") as
+          | (VisualFeedbackProvider & {
+              validateSession?: (id: string) => Promise<unknown>;
+            })
+          | undefined;
+
+        if (opts.session) {
+          // Explicit session option specified by user
+          if (agProvider && typeof agProvider.validateSession === "function") {
+            const v = (await agProvider.validateSession(opts.session)) as
+              | { status: string; reason?: string }
+              | boolean;
+            const status =
+              typeof v === "object" && v !== null
+                ? v.status
+                : v
+                  ? "valid"
+                  : "not-found";
+            if (status === "valid") {
+              activeSessionId = opts.session;
+            } else if (status === "not-found") {
+              sessionNote = `Specified session "${opts.session}" was not found upstream (HTTP 404).`;
+            } else {
+              const reason = typeof v === "object" && v?.reason ? v.reason : status;
+              sessionNote = `Specified session "${opts.session}" could not be confirmed upstream (${reason}).`;
+            }
+          } else {
+            activeSessionId = opts.session;
+          }
+        } else {
+          // Documented selection policy: check most recently mapped session first
+          const existingSessions = dbGetSessionsForClient(db, config.slug);
+          for (const existingId of existingSessions) {
+            if (agProvider && typeof agProvider.validateSession === "function") {
+              const v = (await agProvider.validateSession(existingId)) as
+                | { status: string; reason?: string }
+                | boolean;
+              const status =
+                typeof v === "object" && v !== null
+                  ? v.status
+                  : v
+                    ? "valid"
+                    : "not-found";
+              if (status === "valid") {
+                activeSessionId = existingId;
+                if (existingSessions.length > 1) {
+                  sessionNote = `Using most recent verified mapped session "${activeSessionId}" (${existingSessions.length} mapped sessions; use --session <id> to specify another).`;
+                }
+                break;
+              } else if (status === "not-found") {
+                logger.warn(
+                  `Mapped session "${existingId}" is confirmed stale (HTTP 404 upstream); cleaning up.`,
+                );
+                dbRemoveSessionMapping(db, existingId, config.slug);
+              } else {
+                const reason = typeof v === "object" && v?.reason ? v.reason : status;
+                sessionNote = `Mapped session "${existingId}" cannot be verified upstream (${reason}). Start the watcher or check server connectivity.`;
+                // Preserve mapping on transient error
+              }
+            } else {
+              activeSessionId = existingId;
+              break;
+            }
+          }
+        }
 
         // Check if repository path is configured
         const repoPath = config.repositoryPath;
@@ -570,18 +637,22 @@ export function registerFeedbackCommand(program: Command): void {
           );
           console.log(
             chalk.gray(
-              `     (Using mapped session "${activeSessionId}" for client "${config.slug}")\n`,
+              `     (Using verified mapped session "${activeSessionId}" for client "${config.slug}")\n`,
             ),
           );
+          if (sessionNote) {
+            console.log(chalk.cyan(`     Note: ${sessionNote}\n`));
+          }
         } else {
           console.log(
             chalk.gray(
-              `     import { Agentation } from "agentation";\n\n     function App() {\n       return (\n         <>\n           <YourApp />\n           {process.env.NODE_ENV === "development" && (\n             <Agentation\n               endpoint="http://localhost:${port}"\n               // Once 'aethra feedback watch' runs, pass its provisioned sessionId:\n               // sessionId="<active-session-id>"\n               // Or dynamically register browser-created sessions:\n               // onSessionCreated={(s) => { ... }}\n             />\n           )}\n         </>\n       );\n     }\n`,
+              `     import { Agentation } from "agentation";\n\n     function App() {\n       return (\n         <>\n           <YourApp />\n           {process.env.NODE_ENV === "development" && (\n             <Agentation\n               endpoint="http://localhost:${port}"\n               // Once 'aethra feedback watch' runs, pass its provisioned sessionId:\n               // sessionId="<active-session-id>"\n               // Or dynamically register browser-created sessions:\n               // onSessionCreated={(sessionId: string) => {\n               //   // aethra feedback register-session <sessionId> --client ${config.slug}\n               // }}\n             />\n           )}\n         </>\n       );\n     }\n`,
             ),
           );
           console.log(
             chalk.yellow(
-              `     Notice: No session is mapped yet. Run 'aethra feedback watch --provider agentation --client ${config.slug}'\n` +
+              `     Notice: ${sessionNote ?? `No active verified session found for client "${config.slug}".`}\n` +
+              `     Run 'aethra feedback watch --provider agentation --client ${config.slug}'\n` +
               `     to start the server and provision a verified session, or register a browser session with 'register-session'.\n`,
             ),
           );
@@ -643,23 +714,41 @@ export function registerFeedbackCommand(program: Command): void {
         const { config, workspacePath } =
           await resolveClientWorkspace(clientSlug);
 
-        // If Agentation provider is reachable, verify session existence upstream
+        // Verify session existence upstream before saving mapping
         const agProvider = getProvider("agentation") as
           | (VisualFeedbackProvider & {
-              validateSession?: (id: string) => Promise<boolean>;
+              validateSession?: (id: string) => Promise<unknown>;
             })
           | undefined;
-        if (agProvider && typeof agProvider.validateSession === "function") {
-          const avail = await agProvider.checkAvailability();
-          if (avail.connected) {
-            const valid = await agProvider.validateSession(sessionId);
-            if (!valid) {
-              logger.error(
-                `Cannot register session: session "${sessionId}" does not exist on Agentation server (HTTP 404).`,
-              );
-              process.exit(1);
-            }
-          }
+
+        if (!agProvider || typeof agProvider.validateSession !== "function") {
+          logger.error(
+            "Cannot register session: Agentation provider is unavailable to verify session upstream.",
+          );
+          process.exit(1);
+        }
+
+        const v = (await agProvider.validateSession(sessionId)) as
+          | { status: string; reason?: string }
+          | boolean;
+        const status =
+          typeof v === "object" && v !== null
+            ? v.status
+            : v
+              ? "valid"
+              : "not-found";
+
+        if (status === "not-found") {
+          logger.error(
+            `Cannot register session: session "${sessionId}" does not exist on Agentation server (HTTP 404).`,
+          );
+          process.exit(1);
+        } else if (status !== "valid") {
+          const reason = typeof v === "object" && v?.reason ? v.reason : status;
+          logger.error(
+            `Cannot register session: upstream verification failed (${reason}). Start the Agentation server before registering.`,
+          );
+          process.exit(1);
         }
 
         const db = getDb(workspacePath);
@@ -667,7 +756,7 @@ export function registerFeedbackCommand(program: Command): void {
 
         console.log(
           chalk.green(
-            `\n  ✓ Registered session "${sessionId}" for client "${config.name}".\n`,
+            `\n  ✓ Verified upstream and registered session "${sessionId}" for client "${config.name}".\n`,
           ),
         );
       } catch (err) {
@@ -784,16 +873,31 @@ export function registerFeedbackCommand(program: Command): void {
 
           if (opts.session) {
             // User requested an explicit session
-            const valid =
-              typeof agProvider.validateSession === "function"
-                ? await agProvider.validateSession(opts.session)
-                : true;
-            if (!valid) {
-              logger.error(
-                `Specified session "${opts.session}" does not exist on Agentation server (HTTP 404).`,
-              );
-              await agProvider.stopServer().catch(() => {});
-              process.exit(1);
+            if (agProvider && typeof agProvider.validateSession === "function") {
+              const v = (await agProvider.validateSession(opts.session)) as
+                | { status: string; reason?: string }
+                | boolean;
+              const status =
+                typeof v === "object" && v !== null
+                  ? v.status
+                  : v
+                    ? "valid"
+                    : "not-found";
+              if (status === "not-found") {
+                logger.error(
+                  `Specified session "${opts.session}" does not exist on Agentation server (HTTP 404).`,
+                );
+                await agProvider.stopServer().catch(() => {});
+                process.exit(1);
+              } else if (status !== "valid") {
+                const reason =
+                  typeof v === "object" && v?.reason ? v.reason : status;
+                logger.error(
+                  `Failed to validate specified session "${opts.session}" upstream: ${reason}`,
+                );
+                await agProvider.stopServer().catch(() => {});
+                process.exit(1);
+              }
             }
             try {
               dbSaveSessionMapping(db, opts.session, slug, workspacePath);
@@ -811,23 +915,49 @@ export function registerFeedbackCommand(program: Command): void {
           } else if (!opts.newSession) {
             // Reuse existing valid mapped session if available
             const existingSessions = dbGetSessionsForClient(db, slug);
+            let hasTransientErrors = false;
             for (const existingId of existingSessions) {
-              const valid =
-                typeof agProvider.validateSession === "function"
-                  ? await agProvider.validateSession(existingId)
-                  : true;
-              if (valid) {
-                activeSessionId = existingId;
-                logger.info(
-                  `Reusing active mapped session "${activeSessionId}"`,
-                );
-                break;
+              if (agProvider && typeof agProvider.validateSession === "function") {
+                const v = (await agProvider.validateSession(existingId)) as
+                  | { status: string; reason?: string }
+                  | boolean;
+                const status =
+                  typeof v === "object" && v !== null
+                    ? v.status
+                    : v
+                      ? "valid"
+                      : "not-found";
+                if (status === "valid") {
+                  activeSessionId = existingId;
+                  logger.info(
+                    `Reusing active mapped session "${activeSessionId}"`,
+                  );
+                  break;
+                } else if (status === "not-found") {
+                  logger.warn(
+                    `Mapped session "${existingId}" is confirmed stale (HTTP 404 upstream); cleaning up.`,
+                  );
+                  dbRemoveSessionMapping(db, existingId, slug);
+                } else {
+                  hasTransientErrors = true;
+                  const reason =
+                    typeof v === "object" && v?.reason ? v.reason : status;
+                  logger.warn(
+                    `Upstream validation of mapped session "${existingId}" failed (${reason}); preserving mapping.`,
+                  );
+                }
               } else {
-                logger.warn(
-                  `Mapped session "${existingId}" is stale (not found upstream); cleaning up.`,
-                );
-                dbRemoveSessionMapping(db, existingId);
+                activeSessionId = existingId;
+                break;
               }
+            }
+
+            if (!activeSessionId && hasTransientErrors && existingSessions.length > 0) {
+              logger.error(
+                `Existing mapped sessions could not be confirmed upstream due to server or connection errors. Preserved mappings. Use --new-session to force creation of a new session.`,
+              );
+              await agProvider.stopServer().catch(() => {});
+              process.exit(1);
             }
           }
 

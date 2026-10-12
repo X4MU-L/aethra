@@ -223,6 +223,13 @@ const INTENT_MAP: Record<string, string> = {
   approve: "approve",
 };
 
+export type SessionValidationResult =
+  | { status: "valid"; session?: Record<string, unknown>, reason?: string }
+  | { status: "not-found"; statusCode: 404; reason: string }
+  | { status: "unreachable"; reason: string; error?: Error }
+  | { status: "server-error"; statusCode: number; reason: string }
+  | { status: "malformed"; reason: string };
+
 // ─── Provider ────────────────────────────────────────────────────────────────
 
 export class AgentationProvider extends VisualFeedbackProvider {
@@ -304,15 +311,79 @@ export class AgentationProvider extends VisualFeedbackProvider {
     };
   }
 
-  /** Validate whether a session exists on the Agentation server. */
-  async validateSession(sessionId: string): Promise<boolean> {
+  /** Validate whether a session exists on the Agentation server with typed outcome. */
+  async validateSession(sessionId: string): Promise<SessionValidationResult> {
     try {
       const res = await fetch(`${this.baseUrl}/sessions/${sessionId}`, {
         signal: AbortSignal.timeout(3000),
       });
-      return res.ok;
-    } catch {
-      return false;
+
+      if (res.status === 404) {
+        return {
+          status: "not-found",
+          statusCode: 404,
+          reason: `Session "${sessionId}" was confirmed missing on Agentation server (HTTP 404).`,
+        };
+      }
+
+      if (res.status >= 500) {
+        return {
+          status: "server-error",
+          statusCode: res.status,
+          reason: `Agentation server error (HTTP ${res.status}).`,
+        };
+      }
+
+      if (!res.ok) {
+        return {
+          status: "server-error",
+          statusCode: res.status,
+          reason: `Agentation server returned HTTP ${res.status} (${res.statusText || "Request failed"}).`,
+        };
+      }
+
+      let data: unknown;
+      try {
+        data = await res.json();
+      } catch (parseErr) {
+        return {
+          status: "malformed",
+          reason: `Agentation server returned malformed JSON: ${(parseErr as Error).message}`,
+        };
+      }
+
+      if (!data || typeof data !== "object") {
+        return {
+          status: "malformed",
+          reason: "Agentation server returned unexpected non-object JSON response.",
+        };
+      }
+
+      const sessionObj = data as Record<string, unknown>;
+      if (sessionObj.id !== undefined && String(sessionObj.id) !== sessionId) {
+        return {
+          status: "malformed",
+          reason: `Agentation server returned mismatched session ID "${sessionObj.id}" (expected "${sessionId}").`,
+        };
+      }
+
+      return {
+        status: "valid",
+        session: sessionObj,
+      };
+    } catch (err) {
+      const error = err as Error;
+      const isTimeout =
+        error.name === "TimeoutError" ||
+        error.name === "AbortError" ||
+        error.message.toLowerCase().includes("timeout");
+      return {
+        status: "unreachable",
+        reason: isTimeout
+          ? `Connection to Agentation server timed out: ${error.message}`
+          : `Could not reach Agentation server: ${error.message}`,
+        error,
+      };
     }
   }
 
@@ -337,11 +408,17 @@ export class AgentationProvider extends VisualFeedbackProvider {
 
     // If an explicit sessionId is requested, verify it exists upstream
     if (opts.sessionId) {
-      const exists = await this.validateSession(opts.sessionId);
-      if (!exists) {
+      const validation = await this.validateSession(opts.sessionId);
+      if (validation.status === "not-found") {
         return {
           success: false,
           error: `Specified session "${opts.sessionId}" does not exist on Agentation server (HTTP 404)`,
+        };
+      }
+      if (validation.status !== "valid") {
+        return {
+          success: false,
+          error: `Failed to validate session "${opts.sessionId}" upstream: ${validation.reason}`,
         };
       }
 
@@ -747,18 +824,26 @@ export class AgentationProvider extends VisualFeedbackProvider {
 
     // Strict fail-closed isolation when clientSlug is provided:
     if (clientSlug) {
-      if (!targetSessionId) {
+      if (!this.workspacePath) {
+        logger.warn(
+          `Agentation SSE: rejected event for client "${clientSlug}" because workspace context is missing (fail-closed isolation)`,
+        );
         return false;
       }
 
-      if (this.workspacePath) {
-        const db = getDb(this.workspacePath);
-        if (!dbIsSessionMapped(db, targetSessionId, clientSlug)) {
-          logger.debug(
-            `Agentation SSE: ignored annotation from session ${targetSessionId} (not mapped to client "${clientSlug}")`,
-          );
-          return false;
-        }
+      if (!targetSessionId) {
+        logger.warn(
+          `Agentation SSE: rejected event missing session identity for client "${clientSlug}" (fail-closed isolation)`,
+        );
+        return false;
+      }
+
+      const db = getDb(this.workspacePath);
+      if (!dbIsSessionMapped(db, targetSessionId, clientSlug)) {
+        logger.debug(
+          `Agentation SSE: ignored annotation from session ${targetSessionId} (not mapped to client "${clientSlug}")`,
+        );
+        return false;
       }
     }
 

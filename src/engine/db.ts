@@ -13,6 +13,20 @@ import path from "path";
 import fs from "fs-extra";
 import { logger } from "../core/logger.js";
 import { VisualFeedbackError } from "../core/errors.js";
+import {
+  claimSessionOwnership,
+  releaseSessionOwnership,
+  closeGlobalRegistry,
+  syncLegacySessionMappings,
+} from "./session-registry.js";
+export {
+  claimSessionOwnership,
+  releaseSessionOwnership,
+  getGlobalSessionOwner,
+  setGlobalRegistryPath,
+  clearGlobalRegistry,
+  closeGlobalRegistry,
+} from "./session-registry.js";
 import type {
   TaskRecord,
   Finding,
@@ -40,6 +54,7 @@ export function getDb(workspacePath: string): Database.Database {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   runMigrations(db);
+  syncLegacySessionMappings(db, workspacePath);
   dbCache.set(workspacePath, db);
   return db;
 }
@@ -67,6 +82,7 @@ export function closeAllDbs(): void {
     db.close();
     dbCache.delete(key);
   }
+  closeGlobalRegistry();
 }
 
 // ─── Migrations ──────────────────────────────────────────────────────────────
@@ -766,29 +782,56 @@ export function dbSaveSessionMapping(
   clientSlug: string,
   workspacePath: string,
 ): void {
-  const existing = db
+  // 1. Enforce global cross-workspace ownership first
+  const claimResult = claimSessionOwnership(
+    agentationSessionId,
+    clientSlug,
+    workspacePath,
+  );
+
+  // 2. Enforce local client uniqueness constraint
+  const existingLocal = db
     .prepare(
       "SELECT client_slug FROM session_mappings WHERE agentation_session_id = ?",
     )
     .get(agentationSessionId) as { client_slug: string } | undefined;
 
-  if (existing && existing.client_slug !== clientSlug) {
+  if (existingLocal && existingLocal.client_slug !== clientSlug) {
+    if (!claimResult.existing) {
+      try {
+        releaseSessionOwnership(agentationSessionId, clientSlug);
+      } catch {
+        // ignore
+      }
+    }
     throw new VisualFeedbackError(
-      `Agentation session "${agentationSessionId}" is already mapped to client "${existing.client_slug}" and cannot be assigned to "${clientSlug}".`,
+      `Agentation session "${agentationSessionId}" is already mapped to client "${existingLocal.client_slug}" and cannot be assigned to "${clientSlug}".`,
     );
   }
 
-  db.prepare(
-    `
-    INSERT OR REPLACE INTO session_mappings (agentation_session_id, client_slug, workspace_path, created_at)
-    VALUES (?, ?, ?, ?)
-  `,
-  ).run(
-    agentationSessionId,
-    clientSlug,
-    workspacePath,
-    new Date().toISOString(),
-  );
+  // 3. Save into local workspace database atomically
+  try {
+    db.prepare(
+      `
+      INSERT OR REPLACE INTO session_mappings (agentation_session_id, client_slug, workspace_path, created_at)
+      VALUES (?, ?, ?, ?)
+    `,
+    ).run(
+      agentationSessionId,
+      clientSlug,
+      workspacePath,
+      new Date().toISOString(),
+    );
+  } catch (err) {
+    if (!claimResult.existing) {
+      try {
+        releaseSessionOwnership(agentationSessionId, clientSlug);
+      } catch {
+        // ignore
+      }
+    }
+    throw err;
+  }
 }
 
 export function dbGetClientForSession(
@@ -831,10 +874,20 @@ export function dbIsSessionMapped(
 export function dbRemoveSessionMapping(
   db: Database.Database,
   agentationSessionId: string,
+  clientSlug?: string,
 ): void {
+  // Determine client slug from local DB if not explicitly supplied
+  const ownerSlug =
+    clientSlug ?? dbGetClientForSession(db, agentationSessionId);
+
   db.prepare(
     "DELETE FROM session_mappings WHERE agentation_session_id = ?",
   ).run(agentationSessionId);
+
+  // Safely release global ownership for this client without deleting other clients' sessions
+  if (ownerSlug) {
+    releaseSessionOwnership(agentationSessionId, ownerSlug);
+  }
 }
 
 // ─── Audit run CRUD ──────────────────────────────────────────────────────────

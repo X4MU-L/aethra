@@ -174,4 +174,139 @@ describe("MCP Pending Annotation Observability", () => {
     const ids = res.annotations.map((a) => (a as { id: string }).id);
     expect(ids).toEqual(["ann-shared", "ann-unique"]);
   });
+
+  it("accepts valid object containing an annotations array", async () => {
+    const db = getDb(workspace);
+    dbSaveSessionMapping(db, "session-obj", "client-x", workspace);
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("session-obj")) {
+        return new Response(
+          JSON.stringify({
+            annotations: [{ id: "ann-obj-1", comment: "Object-wrapped annotation" }],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+
+    const res = await testFetchScopedPendingAnnotations(workspace);
+    expect(res.annotations).toHaveLength(1);
+    expect(res.successSessions).toEqual(["session-obj"]);
+    expect(res.failedSessions).toEqual([]);
+    expect((res.annotations[0] as { id: string }).id).toBe("ann-obj-1");
+  });
+
+  it("treats malformed JSON and unexpected response shapes as session failures", async () => {
+    const db = getDb(workspace);
+    dbSaveSessionMapping(db, "session-malformed-json", "client-x", workspace);
+    dbSaveSessionMapping(db, "session-unexpected-schema", "client-x", workspace);
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("session-malformed-json")) {
+        // HTTP 200 but broken JSON
+        return new Response("{ invalid json", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (urlStr.includes("session-unexpected-schema")) {
+        // HTTP 200 but unexpected JSON shape (object without annotations array)
+        return new Response(JSON.stringify({ error: "Something broke", code: 123 }), {
+          status: 200,
+        });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+
+    const res = await testFetchScopedPendingAnnotations(workspace);
+    expect(res.annotations).toHaveLength(0);
+    expect(res.successSessions).toHaveLength(0);
+    expect(res.failedSessions).toHaveLength(2);
+    expect(res.failedSessions.some((f) => f.sessionId === "session-malformed-json" && f.error.includes("Malformed JSON"))).toBe(true);
+    expect(res.failedSessions.some((f) => f.sessionId === "session-unexpected-schema" && f.error.includes("Malformed upstream response schema"))).toBe(true);
+  });
+
+  it("treats HTTP 500, 503, and network timeouts as session failures", async () => {
+    const db = getDb(workspace);
+    dbSaveSessionMapping(db, "session-500", "client-x", workspace);
+    dbSaveSessionMapping(db, "session-503", "client-x", workspace);
+    dbSaveSessionMapping(db, "session-timeout", "client-x", workspace);
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("session-500")) {
+        return new Response("Server error", { status: 500 });
+      }
+      if (urlStr.includes("session-503")) {
+        return new Response("Service unavailable", { status: 503 });
+      }
+      if (urlStr.includes("session-timeout")) {
+        const timeoutErr = new Error("The operation was aborted due to timeout");
+        timeoutErr.name = "TimeoutError";
+        throw timeoutErr;
+      }
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+
+    const res = await testFetchScopedPendingAnnotations(workspace);
+    expect(res.annotations).toHaveLength(0);
+    expect(res.successSessions).toHaveLength(0);
+    expect(res.failedSessions).toHaveLength(3);
+  });
+
+  it("watchAnnotations surfaces total failure when all mapped sessions fail during watch", async () => {
+    const { testHandleWatchAnnotations } = await import("../../src/mcp/server.js");
+    const db = getDb(workspace);
+    dbSaveSessionMapping(db, "session-watch-fail", "client-x", workspace);
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (urlStr.includes("session-watch-fail")) {
+        return new Response("Internal Server Error", { status: 500 });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+
+    const watchRes = await testHandleWatchAnnotations(workspace, 1);
+    expect((watchRes as { isError?: boolean }).isError).toBe(true);
+    expect(watchRes.content[0].text).toContain("All mapped sessions failed during watch");
+    expect(watchRes.content[0].text).toContain("session-watch-fail");
+  });
+
+  it("watchAnnotations reports partial failure when a healthy session is empty while another fails", async () => {
+    const { testHandleWatchAnnotations } = await import("../../src/mcp/server.js");
+    const db = getDb(workspace);
+    dbSaveSessionMapping(db, "session-watch-healthy-empty", "client-x", workspace);
+    dbSaveSessionMapping(db, "session-watch-error", "client-x", workspace);
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (urlStr.includes("session-watch-healthy-empty")) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (urlStr.includes("session-watch-error")) {
+        return new Response("Bad Gateway", { status: 502 });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+
+    const watchRes = await testHandleWatchAnnotations(workspace, 1);
+    // Not a fatal total error because healthy session succeeded, but partial failure is surfaced
+    expect((watchRes as { isError?: boolean }).isError).toBeFalsy();
+    const parsed = JSON.parse(watchRes.content[0].text);
+    expect(parsed.annotations).toEqual([]);
+    expect(parsed.partial).toBe(true);
+    expect(parsed.failedSessions).toHaveLength(1);
+    expect(parsed.failedSessions[0].sessionId).toBe("session-watch-error");
+  });
 });

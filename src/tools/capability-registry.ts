@@ -91,7 +91,7 @@ const CAPABILITY_REGISTRY: CapabilityRegistryEntry[] = [
     name: "Design Visual Critique",
     category: "design-evaluation",
     description:
-      "Independent visual evaluation of rendered UI against design brief",
+      "Structured visual evaluation prompt generation against design brief (automated scoring pending multimodal evaluator)",
     applicableTasks: ["design-exploration"],
     workflowStages: ["verify"],
     prerequisites: [],

@@ -323,11 +323,11 @@ export function registerDesignCommand(program: Command): void {
             const runDir = path.join(screenshotsDir, runName);
             const resolvedRunDir = path.resolve(runDir);
             const resolvedScreenshotsDir = path.resolve(screenshotsDir);
+            const rel = path.relative(resolvedScreenshotsDir, resolvedRunDir);
+            const isContained =
+              rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
 
-            if (
-              !resolvedRunDir.startsWith(resolvedScreenshotsDir) ||
-              !(await pathExists(runDir))
-            ) {
+            if (!isContained || !(await pathExists(runDir))) {
               logger.warn(`Screenshot directory for run not found: ${runDir}`);
             } else {
               const files = await fs.readdir(runDir);
