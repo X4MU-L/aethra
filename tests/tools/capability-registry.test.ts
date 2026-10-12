@@ -2,7 +2,7 @@
  * Tests for the capability registry (src/tools/capability-registry.ts).
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   listCapabilities,
   getCapability,
@@ -117,6 +117,47 @@ describe("checkCapabilityAvailability", () => {
   it("returns available for 'code-analysis' (no deps, always available)", async () => {
     const result = await checkCapabilityAvailability("code-analysis");
     expect(result.status).toBe("available");
+  });
+
+  it("returns 'requires-setup' for visual-annotation when Agentation server is not running", async () => {
+    const { getProvider } = await import(
+      "../../src/visual-feedback/providers/registry.js"
+    );
+    const provider = getProvider("agentation")!;
+    const spy = vi.spyOn(provider, "checkAvailability").mockResolvedValueOnce({
+      available: true,
+      connected: false,
+      version: null,
+      error: "Agentation server not running",
+      capabilities: provider.reportCapabilities(),
+    });
+    try {
+      const result = await checkCapabilityAvailability("visual-annotation");
+      expect(result.status).toBe("requires-setup");
+      expect(result.message).toContain("Agentation server not running");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("returns 'available' for visual-annotation when Agentation server is operational", async () => {
+    const { getProvider } = await import(
+      "../../src/visual-feedback/providers/registry.js"
+    );
+    const provider = getProvider("agentation")!;
+    const spy = vi.spyOn(provider, "checkAvailability").mockResolvedValueOnce({
+      available: true,
+      connected: true,
+      version: null,
+      error: null,
+      capabilities: provider.reportCapabilities(),
+    });
+    try {
+      const result = await checkCapabilityAvailability("visual-annotation");
+      expect(result.status).toBe("available");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

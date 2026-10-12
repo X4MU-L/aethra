@@ -304,10 +304,22 @@ export class AgentationProvider extends VisualFeedbackProvider {
     };
   }
 
+  /** Validate whether a session exists on the Agentation server. */
+  async validateSession(sessionId: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/sessions/${sessionId}`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
   async startSession(opts: {
     pageUrl: string;
     clientSlug: string;
-    sessionId: string;
+    sessionId?: string;
   }): Promise<{
     success: boolean;
     sessionUrl?: string;
@@ -323,7 +335,43 @@ export class AgentationProvider extends VisualFeedbackProvider {
       };
     }
 
-    // Create a real session on the Agentation server
+    // If an explicit sessionId is requested, verify it exists upstream
+    if (opts.sessionId) {
+      const exists = await this.validateSession(opts.sessionId);
+      if (!exists) {
+        return {
+          success: false,
+          error: `Specified session "${opts.sessionId}" does not exist on Agentation server (HTTP 404)`,
+        };
+      }
+
+      if (this.workspacePath) {
+        try {
+          dbSaveSessionMapping(
+            getDb(this.workspacePath),
+            opts.sessionId,
+            opts.clientSlug,
+            this.workspacePath,
+          );
+        } catch (mapErr) {
+          return {
+            success: false,
+            error: `Session mapping failed: ${(mapErr as Error).message}`,
+          };
+        }
+      }
+
+      logger.info(
+        `Agentation session ${opts.sessionId} verified upstream and mapped to client "${opts.clientSlug}"`,
+      );
+      return {
+        success: true,
+        sessionUrl: opts.pageUrl,
+        sessionId: opts.sessionId,
+      };
+    }
+
+    // Otherwise, create a real session on the Agentation server
     try {
       const res = await fetch(`${this.baseUrl}/sessions`, {
         method: "POST",
@@ -368,7 +416,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
       }
 
       logger.info(
-        `Agentation session ${agentationSessionId} created and mapped to client "${opts.clientSlug}"`,
+        `Agentation session ${agentationSessionId} created upstream and mapped to client "${opts.clientSlug}"`,
       );
       return {
         success: true,
@@ -658,6 +706,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
     event: Record<string, unknown>,
     callback: (annotation: RawAnnotation) => void,
     clientSlug?: string,
+    streamSessionId?: string,
   ): boolean {
     if (
       event.type !== "annotation.created" ||
@@ -670,20 +719,43 @@ export class AgentationProvider extends VisualFeedbackProvider {
     const evSessionId =
       event.sessionId ?? ann.sessionId ?? ann._sessionId;
 
+    let targetSessionId: string | undefined;
+
+    if (streamSessionId) {
+      // Session-scoped stream:
+      // If event supplies a session ID that conflicts with the endpoint, fail closed and reject it
+      if (evSessionId && String(evSessionId) !== streamSessionId) {
+        logger.warn(
+          `Agentation SSE: rejected event with conflicting sessionId "${evSessionId}" on stream for "${streamSessionId}"`,
+        );
+        return false;
+      }
+      // On session-scoped streams, event inherits the stream's session identity
+      targetSessionId = streamSessionId;
+    } else {
+      // Global stream: event must supply a trustworthy session ID
+      if (!evSessionId) {
+        if (clientSlug) {
+          logger.warn(
+            `Agentation SSE: rejected event without sessionId for client "${clientSlug}" (fail-closed isolation)`,
+          );
+        }
+        return false;
+      }
+      targetSessionId = String(evSessionId);
+    }
+
     // Strict fail-closed isolation when clientSlug is provided:
     if (clientSlug) {
-      if (!evSessionId) {
-        logger.warn(
-          `Agentation SSE: rejected event without sessionId for client "${clientSlug}" (fail-closed isolation)`,
-        );
+      if (!targetSessionId) {
         return false;
       }
 
       if (this.workspacePath) {
         const db = getDb(this.workspacePath);
-        if (!dbIsSessionMapped(db, String(evSessionId), clientSlug)) {
+        if (!dbIsSessionMapped(db, targetSessionId, clientSlug)) {
           logger.debug(
-            `Agentation SSE: ignored annotation from session ${evSessionId} (not mapped to client "${clientSlug}")`,
+            `Agentation SSE: ignored annotation from session ${targetSessionId} (not mapped to client "${clientSlug}")`,
           );
           return false;
         }
@@ -692,7 +764,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
 
     callback({
       ...ann,
-      _sessionId: evSessionId ? String(evSessionId) : undefined,
+      _sessionId: targetSessionId,
     });
     return true;
   }
@@ -748,7 +820,7 @@ export class AgentationProvider extends VisualFeedbackProvider {
               if (line.startsWith("data: ")) {
                 try {
                   const event = JSON.parse(line.slice(6));
-                  this.processSSEEvent(event, callback, clientSlug);
+                  this.processSSEEvent(event, callback, clientSlug, sessionId);
                 } catch {
                   // Skip malformed SSE data
                 }

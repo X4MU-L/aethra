@@ -809,7 +809,7 @@ export function dbGetSessionsForClient(
 ): string[] {
   const rows = db
     .prepare(
-      "SELECT agentation_session_id FROM session_mappings WHERE client_slug = ?",
+      "SELECT agentation_session_id FROM session_mappings WHERE client_slug = ? ORDER BY created_at DESC",
     )
     .all(clientSlug) as Array<{ agentation_session_id: string }>;
   return rows.map((r) => r.agentation_session_id);
@@ -826,6 +826,15 @@ export function dbIsSessionMapped(
     )
     .get(agentationSessionId, clientSlug);
   return row !== undefined;
+}
+
+export function dbRemoveSessionMapping(
+  db: Database.Database,
+  agentationSessionId: string,
+): void {
+  db.prepare(
+    "DELETE FROM session_mappings WHERE agentation_session_id = ?",
+  ).run(agentationSessionId);
 }
 
 // ─── Audit run CRUD ──────────────────────────────────────────────────────────

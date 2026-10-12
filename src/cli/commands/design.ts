@@ -310,11 +310,26 @@ export function registerDesignCommand(program: Command): void {
           const { promises: fs } = await import("fs");
 
           if (opts.run) {
+            if (!/^[a-zA-Z0-9_-]+$/.test(opts.run)) {
+              logger.error(
+                `Invalid run identifier "${opts.run}". Must contain only alphanumeric characters, dashes, and underscores.`,
+              );
+              process.exit(1);
+            }
+
             const runName = opts.run.startsWith("run-")
               ? opts.run
               : `run-${opts.run}`;
             const runDir = path.join(screenshotsDir, runName);
-            if (await pathExists(runDir)) {
+            const resolvedRunDir = path.resolve(runDir);
+            const resolvedScreenshotsDir = path.resolve(screenshotsDir);
+
+            if (
+              !resolvedRunDir.startsWith(resolvedScreenshotsDir) ||
+              !(await pathExists(runDir))
+            ) {
+              logger.warn(`Screenshot directory for run not found: ${runDir}`);
+            } else {
               const files = await fs.readdir(runDir);
               for (const f of files) {
                 if (/\.(png|jpg|jpeg|webp)$/i.test(f)) {
@@ -322,8 +337,6 @@ export function registerDesignCommand(program: Command): void {
                 }
               }
               logger.info(`Using screenshots from specified run: ${runName}`);
-            } else {
-              logger.warn(`Screenshot directory for run not found: ${runDir}`);
             }
           } else {
             // Find latest run subdirectory by modified time to avoid mixing historical audits

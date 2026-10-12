@@ -1,0 +1,177 @@
+/**
+ * Tests for MCP retrieval observability and error propagation.
+ *
+ * Requirements:
+ * - A genuinely empty, successfully queried queue must remain distinguishable from an unavailable server.
+ * - Non-successful HTTP responses must not silently become an empty queue.
+ * - Partial session failures must be surfaced with affected sessions.
+ * - If every relevant session fails, an explicit failure status is returned.
+ * - Deduplication across multiple authorized sessions is preserved.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import path from "path";
+import os from "os";
+import fs from "fs-extra";
+import { getDb, closeDb, dbSaveSessionMapping } from "../../src/engine/db.js";
+import {
+  testFetchScopedPendingAnnotations,
+  testHandleGetPendingAnnotations,
+} from "../../src/mcp/server.js";
+
+describe("MCP Pending Annotation Observability", () => {
+  let tmpRoot: string;
+  let workspace: string;
+  let origFetch: typeof globalThis.fetch;
+
+  beforeEach(async () => {
+    tmpRoot = path.join(
+      os.tmpdir(),
+      `aethra-mcp-obs-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    );
+    workspace = path.join(tmpRoot, "client-x");
+    await fs.ensureDir(workspace);
+
+    await fs.writeFile(
+      path.join(workspace, "client.yaml"),
+      "slug: client-x\nname: Client X\nprimaryUrl: http://localhost:3000\n",
+    );
+
+    origFetch = globalThis.fetch;
+  });
+
+  afterEach(async () => {
+    globalThis.fetch = origFetch;
+    closeDb(workspace);
+    await fs.remove(tmpRoot);
+  });
+
+  it("distinguishes genuinely empty queue from network failures", async () => {
+    const db = getDb(workspace);
+    dbSaveSessionMapping(db, "session-empty", "client-x", workspace);
+
+    // Mock fetch returning empty array with HTTP 200
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/sessions/session-empty/pending")) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+
+    const res = await testFetchScopedPendingAnnotations(workspace);
+    expect(res.annotations).toEqual([]);
+    expect(res.successSessions).toEqual(["session-empty"]);
+    expect(res.failedSessions).toEqual([]);
+
+    const handleRes = await testHandleGetPendingAnnotations(workspace);
+    expect((handleRes as { isError?: boolean }).isError).toBeFalsy();
+    const parsed = JSON.parse(handleRes.content[0].text);
+    expect(parsed.count).toBe(0);
+    expect(parsed.partial).toBeUndefined();
+  });
+
+  it("surfaces total failure when all mapped sessions fail", async () => {
+    const db = getDb(workspace);
+    dbSaveSessionMapping(db, "session-err-1", "client-x", workspace);
+    dbSaveSessionMapping(db, "session-err-2", "client-x", workspace);
+
+    // Mock fetch failing on both
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("session-err-1")) {
+        return new Response("Internal Server Error", { status: 500 });
+      }
+      if (urlStr.includes("session-err-2")) {
+        throw new Error("Connection refused");
+      }
+      if (urlStr.includes("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+
+    const res = await testFetchScopedPendingAnnotations(workspace);
+    expect(res.annotations).toHaveLength(0);
+    expect(res.successSessions).toHaveLength(0);
+    expect(res.failedSessions).toHaveLength(2);
+
+    const handleRes = await testHandleGetPendingAnnotations(workspace);
+    // Must return an explicit error result, NOT a silent empty queue
+    expect((handleRes as { isError?: boolean }).isError).toBe(true);
+    expect(handleRes.content[0].text).toContain("Failed to retrieve pending annotations for all mapped sessions");
+    expect(handleRes.content[0].text).toContain("session-err-1");
+    expect(handleRes.content[0].text).toContain("session-err-2");
+  });
+
+  it("surfaces partial success and identifies failed sessions", async () => {
+    const db = getDb(workspace);
+    dbSaveSessionMapping(db, "session-good", "client-x", workspace);
+    dbSaveSessionMapping(db, "session-bad", "client-x", workspace);
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (urlStr.includes("session-good")) {
+        return new Response(
+          JSON.stringify([{ id: "ann-good-1", comment: "Legitimate annotation" }]),
+          { status: 200 },
+        );
+      }
+      if (urlStr.includes("session-bad")) {
+        return new Response("Gateway Timeout", { status: 504 });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+
+    const res = await testFetchScopedPendingAnnotations(workspace);
+    expect(res.annotations).toHaveLength(1);
+    expect(res.successSessions).toEqual(["session-good"]);
+    expect(res.failedSessions).toHaveLength(1);
+    expect(res.failedSessions[0].sessionId).toBe("session-bad");
+
+    const handleRes = await testHandleGetPendingAnnotations(workspace);
+    expect((handleRes as { isError?: boolean }).isError).toBeFalsy();
+    const parsed = JSON.parse(handleRes.content[0].text);
+    expect(parsed.count).toBe(1);
+    expect(parsed.partial).toBe(true);
+    expect(parsed.failedSessions).toHaveLength(1);
+    expect(parsed.failedSessions[0].sessionId).toBe("session-bad");
+  });
+
+  it("deduplicates annotations across multiple sessions", async () => {
+    const db = getDb(workspace);
+    dbSaveSessionMapping(db, "session-1", "client-x", workspace);
+    dbSaveSessionMapping(db, "session-2", "client-x", workspace);
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/health")) {
+        return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+      }
+      if (urlStr.includes("session-1")) {
+        return new Response(
+          JSON.stringify([{ id: "ann-shared", comment: "Shared annotation" }]),
+          { status: 200 },
+        );
+      }
+      if (urlStr.includes("session-2")) {
+        return new Response(
+          JSON.stringify([
+            { id: "ann-shared", comment: "Shared annotation duplicate" },
+            { id: "ann-unique", comment: "Unique annotation" },
+          ]),
+          { status: 200 },
+        );
+      }
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+
+    const res = await testFetchScopedPendingAnnotations(workspace);
+    expect(res.annotations).toHaveLength(2); // ann-shared and ann-unique
+    const ids = res.annotations.map((a) => (a as { id: string }).id);
+    expect(ids).toEqual(["ann-shared", "ann-unique"]);
+  });
+});

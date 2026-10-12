@@ -81,7 +81,9 @@ const CAPABILITY_REGISTRY: CapabilityRegistryEntry[] = [
       const provider = getProvider("agentation");
       if (!provider) return "unavailable";
       const status = await provider.checkAvailability();
-      return status.available ? "available" : "requires-setup";
+      return status.available && status.connected
+        ? "available"
+        : "requires-setup";
     },
   },
   {
@@ -201,6 +203,40 @@ export async function checkCapabilityAvailability(
   const entry = getCapability(id);
   if (!entry)
     return { id, status: "unavailable", message: `Unknown capability: ${id}` };
+
+  if (entry.id === "visual-annotation") {
+    const { getProvider } =
+      await import("../visual-feedback/providers/registry.js");
+    const provider = getProvider("agentation");
+    if (!provider) {
+      return {
+        id,
+        status: "unavailable",
+        message: "Agentation provider not registered",
+      };
+    }
+    const provStatus = await provider.checkAvailability();
+    if (!provStatus.available) {
+      return {
+        id,
+        status: "requires-setup",
+        message:
+          provStatus.error ??
+          "agentation-mcp package is not installed. Run: npm install agentation-mcp",
+      };
+    }
+    if (!provStatus.connected) {
+      return {
+        id,
+        status: "requires-setup",
+        message:
+          provStatus.error ??
+          "Agentation server not running. Start with: aethra feedback watch --provider agentation",
+      };
+    }
+    return { id, status: "available" };
+  }
+
   const status = await entry.availabilityCheck();
   return { id, status };
 }

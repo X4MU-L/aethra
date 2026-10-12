@@ -10,7 +10,11 @@
 import crypto from "crypto";
 import path from "path";
 import { glob } from "glob";
-import type { CritiqueResult, DesignBrief } from "../core/schemas.js";
+import {
+  CritiqueResultSchema,
+  type CritiqueResult,
+  type DesignBrief,
+} from "../core/schemas.js";
 import { writeJson, readJson, ensureDir, pathExists } from "../engine/fs.js";
 import { logger } from "../core/logger.js";
 
@@ -145,9 +149,10 @@ export async function loadCritique(
 
   for (const file of files) {
     try {
-      const critique = await readJson<CritiqueResult>(path.join(dir, file));
-      if (critique.taskId === taskId) {
-        matches.push(critique);
+      const raw = await readJson<unknown>(path.join(dir, file));
+      const parsed = CritiqueResultSchema.safeParse(raw);
+      if (parsed.success && parsed.data.taskId === taskId) {
+        matches.push(parsed.data);
       }
     } catch {
       // Skip malformed files

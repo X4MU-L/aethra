@@ -44,7 +44,7 @@ export abstract class VisualFeedbackProvider {
   abstract startSession(opts: {
     pageUrl: string;
     clientSlug: string;
-    sessionId: string;
+    sessionId?: string;
   }): Promise<{
     success: boolean;
     sessionUrl?: string;

@@ -1010,14 +1010,32 @@ function getWorkspaceSessionScope(): {
 /** Verify that an annotation belongs to one of this workspace's mapped sessions. */
 async function verifyAnnotationWorkspaceOwnership(
   annotationId: string,
-): Promise<{ authorized: boolean; reason?: string }> {
+): Promise<{
+  authorized: boolean;
+  reason?: string;
+  upstreamAnnotationId?: string;
+  localFeedbackId?: string;
+}> {
   const { clientSlug, mappedSessions } = getWorkspaceSessionScope();
   const db = getDb(workspacePath);
 
-  // 1. Check local DB
-  const localFb =
-    dbFindFeedbackByProviderAnnotation(db, "agentation", annotationId, clientSlug) ??
-    dbLoadFeedback(db, annotationId);
+  // 1. Check local DB by provider annotation ID first
+  let localFb = dbFindFeedbackByProviderAnnotation(
+    db,
+    "agentation",
+    annotationId,
+    clientSlug,
+  );
+  let isInternalId = false;
+
+  // Fallback: Check if annotationId is an internal Aethra feedback ID
+  if (!localFb) {
+    const byInternalId = dbLoadFeedback(db, annotationId);
+    if (byInternalId) {
+      localFb = byInternalId;
+      isInternalId = true;
+    }
+  }
 
   if (localFb) {
     if (localFb.clientId !== clientSlug) {
@@ -1026,17 +1044,41 @@ async function verifyAnnotationWorkspaceOwnership(
         reason: `Annotation belongs to client "${localFb.clientId}", not current workspace client "${clientSlug}"`,
       };
     }
-    // Verify that stored session belongs to current workspace's mapped sessions
+
+    if (localFb.provider !== "agentation") {
+      return {
+        authorized: false,
+        reason: `Feedback "${annotationId}" is a local/${localFb.provider} record, not an upstream Agentation annotation`,
+      };
+    }
+
+    // Agentation record must have a valid mapped session
+    if (!localFb.sessionId) {
+      return {
+        authorized: false,
+        reason: `Agentation record "${annotationId}" has no associated session ID`,
+      };
+    }
+
     if (
-      localFb.sessionId &&
-      (mappedSessions.length === 0 || !mappedSessions.includes(localFb.sessionId))
+      mappedSessions.length === 0 ||
+      !mappedSessions.includes(localFb.sessionId)
     ) {
       return {
         authorized: false,
         reason: `Annotation session "${localFb.sessionId}" is not mapped to workspace "${clientSlug}"`,
       };
     }
-    return { authorized: true };
+
+    const upstreamId = isInternalId
+      ? localFb.providerAnnotationId ?? annotationId
+      : annotationId;
+
+    return {
+      authorized: true,
+      upstreamAnnotationId: upstreamId,
+      localFeedbackId: localFb.id,
+    };
   }
 
   // 2. Not in local DB — check upstream annotation's session
@@ -1057,7 +1099,10 @@ async function verifyAnnotationWorkspaceOwnership(
         reason: `Annotation ${annotationId} belongs to session ${ann.sessionId ?? "unknown"}, which is not mapped to workspace "${clientSlug}"`,
       };
     }
-    return { authorized: true };
+    return {
+      authorized: true,
+      upstreamAnnotationId: annotationId,
+    };
   } catch (err) {
     return {
       authorized: false,
@@ -1080,22 +1125,64 @@ export async function checkAnnotationWorkspaceOwnership(
   }
 }
 
+/** Exported for MCP retrieval observability tests. */
+export async function testFetchScopedPendingAnnotations(
+  targetWorkspacePath: string,
+): Promise<ScopedPendingResult> {
+  const prevWp = workspacePath;
+  try {
+    workspacePath = targetWorkspacePath;
+    return await fetchScopedPendingAnnotations();
+  } finally {
+    workspacePath = prevWp;
+  }
+}
+
+/** Exported for MCP retrieval observability tests. */
+export async function testHandleGetPendingAnnotations(
+  targetWorkspacePath: string,
+) {
+  const prevWp = workspacePath;
+  try {
+    workspacePath = targetWorkspacePath;
+    return await handleGetPendingAnnotations();
+  } finally {
+    workspacePath = prevWp;
+  }
+}
+
+export interface ScopedPendingResult {
+  annotations: unknown[];
+  successSessions: string[];
+  failedSessions: Array<{ sessionId: string; error: string }>;
+}
+
 /** Fetch pending annotations only from sessions mapped to this workspace. */
-async function fetchScopedPendingAnnotations(): Promise<unknown[]> {
+async function fetchScopedPendingAnnotations(): Promise<ScopedPendingResult> {
   const { mappedSessions } = getWorkspaceSessionScope();
 
   if (mappedSessions.length === 0) {
-    return [];
+    return { annotations: [], successSessions: [], failedSessions: [] };
   }
 
   const allPending: unknown[] = [];
+  const seenAnnotationIds = new Set<string>();
+  const successSessions: string[] = [];
+  const failedSessions: Array<{ sessionId: string; error: string }> = [];
+
   for (const sessionId of mappedSessions) {
     try {
       const res = await fetch(
         `${AGENTATION_BASE}/sessions/${sessionId}/pending`,
         { signal: AbortSignal.timeout(5000) },
       );
-      if (!res.ok) continue;
+      if (!res.ok) {
+        failedSessions.push({
+          sessionId,
+          error: `HTTP ${res.status}: ${res.statusText || "Request failed"}`,
+        });
+        continue;
+      }
       const data = await res.json();
       const annotations = Array.isArray(data)
         ? data
@@ -1103,17 +1190,33 @@ async function fetchScopedPendingAnnotations(): Promise<unknown[]> {
           ? (data as { annotations: unknown[] }).annotations
           : [];
 
+      successSessions.push(sessionId);
+
       for (const a of annotations) {
+        const item = a as Record<string, unknown>;
+        const annId = item.id ? String(item.id) : undefined;
+        if (annId) {
+          if (seenAnnotationIds.has(annId)) continue;
+          seenAnnotationIds.add(annId);
+        }
         allPending.push({
-          ...(a as Record<string, unknown>),
+          ...item,
           sessionId,
         });
       }
-    } catch {
-      // Skip failing sessions
+    } catch (err) {
+      failedSessions.push({
+        sessionId,
+        error: (err as Error).message || "Network error",
+      });
     }
   }
-  return allPending;
+
+  return {
+    annotations: allPending,
+    successSessions,
+    failedSessions,
+  };
 }
 
 async function handleGetPendingAnnotations() {
@@ -1144,13 +1247,52 @@ async function handleGetPendingAnnotations() {
   }
 
   try {
-    const allPending = await fetchScopedPendingAnnotations();
+    const result = await fetchScopedPendingAnnotations();
+
+    // If every mapped session failed:
+    if (
+      result.failedSessions.length > 0 &&
+      result.successSessions.length === 0
+    ) {
+      const errorDetails = result.failedSessions
+        .map((f) => `Session ${f.sessionId}: ${f.error}`)
+        .join("; ");
+      return errorResult(
+        `Failed to retrieve pending annotations for all mapped sessions: ${errorDetails}`,
+      );
+    }
+
+    // Partial failure (some succeeded, some failed)
+    if (result.failedSessions.length > 0) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                annotations: result.annotations,
+                count: result.annotations.length,
+                partial: true,
+                failedSessions: result.failedSessions,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+
+    // Complete success
     return {
       content: [
         {
           type: "text" as const,
           text: JSON.stringify(
-            { annotations: allPending, count: allPending.length },
+            {
+              annotations: result.annotations,
+              count: result.annotations.length,
+            },
             null,
             2,
           ),
@@ -1196,6 +1338,8 @@ async function handleWatchAnnotations(timeoutSeconds?: number) {
     const startTime = Date.now();
     const collected: unknown[] = [];
     const seenIds = new Set<string>();
+    const sessionErrors = new Map<string, string>();
+    const successfulSessions = new Set<string>();
 
     while (Date.now() - startTime < timeout * 1000) {
       for (const sessionId of mappedSessions) {
@@ -1204,7 +1348,16 @@ async function handleWatchAnnotations(timeoutSeconds?: number) {
             `${AGENTATION_BASE}/sessions/${sessionId}/pending`,
             { signal: AbortSignal.timeout(3000) },
           );
-          if (!res.ok) continue;
+          if (!res.ok) {
+            sessionErrors.set(
+              sessionId,
+              `HTTP ${res.status}: ${res.statusText || "Request failed"}`,
+            );
+            continue;
+          }
+          successfulSessions.add(sessionId);
+          sessionErrors.delete(sessionId);
+
           const data = await res.json();
           const annotations = Array.isArray(data)
             ? data
@@ -1220,14 +1373,32 @@ async function handleWatchAnnotations(timeoutSeconds?: number) {
               collected.push({ ...ann, sessionId });
             }
           }
-        } catch {
-          // Skip
+        } catch (err) {
+          sessionErrors.set(sessionId, (err as Error).message || "Network error");
         }
       }
 
       if (collected.length > 0) break;
       await new Promise((r) => setTimeout(r, 2000));
     }
+
+    if (
+      successfulSessions.size === 0 &&
+      sessionErrors.size > 0 &&
+      collected.length === 0
+    ) {
+      const errList = Array.from(sessionErrors.entries())
+        .map(([s, e]) => `${s}: ${e}`)
+        .join("; ");
+      return errorResult(`All mapped sessions failed during watch: ${errList}`);
+    }
+
+    const failedSessions = Array.from(sessionErrors.entries()).map(
+      ([sessionId, error]) => ({
+        sessionId,
+        error,
+      }),
+    );
 
     return {
       content: [
@@ -1238,6 +1409,7 @@ async function handleWatchAnnotations(timeoutSeconds?: number) {
               annotations: collected,
               count: collected.length,
               waitedSeconds: Math.round((Date.now() - startTime) / 1000),
+              ...(failedSessions.length > 0 ? { partial: true, failedSessions } : {}),
             },
             null,
             2,
@@ -1262,7 +1434,9 @@ async function handleResolveAnnotation(annotationId: string, summary?: string) {
   }
 
   try {
-    const res = await fetch(`${AGENTATION_BASE}/annotations/${annotationId}`, {
+    const targetId = auth.upstreamAnnotationId ?? annotationId;
+
+    const res = await fetch(`${AGENTATION_BASE}/annotations/${targetId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1279,7 +1453,7 @@ async function handleResolveAnnotation(annotationId: string, summary?: string) {
     }
 
     if (summary) {
-      await fetch(`${AGENTATION_BASE}/annotations/${annotationId}/thread`, {
+      await fetch(`${AGENTATION_BASE}/annotations/${targetId}/thread`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1294,8 +1468,10 @@ async function handleResolveAnnotation(annotationId: string, summary?: string) {
     const db = getDb(workspacePath);
     const { clientSlug } = getWorkspaceSessionScope();
     const local =
-      dbFindFeedbackByProviderAnnotation(db, "agentation", annotationId, clientSlug) ??
-      dbLoadFeedback(db, annotationId);
+      dbFindFeedbackByProviderAnnotation(db, "agentation", targetId, clientSlug) ??
+      (auth.localFeedbackId
+        ? dbLoadFeedback(db, auth.localFeedbackId)
+        : dbLoadFeedback(db, annotationId));
     if (local) {
       dbUpdateFeedbackLifecycle(db, local.id, {
         status: "resolved",
@@ -1330,7 +1506,9 @@ async function handleDismissAnnotation(annotationId: string, reason: string) {
   }
 
   try {
-    const res = await fetch(`${AGENTATION_BASE}/annotations/${annotationId}`, {
+    const targetId = auth.upstreamAnnotationId ?? annotationId;
+
+    const res = await fetch(`${AGENTATION_BASE}/annotations/${targetId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1346,7 +1524,7 @@ async function handleDismissAnnotation(annotationId: string, reason: string) {
       );
     }
 
-    await fetch(`${AGENTATION_BASE}/annotations/${annotationId}/thread`, {
+    await fetch(`${AGENTATION_BASE}/annotations/${targetId}/thread`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1360,8 +1538,10 @@ async function handleDismissAnnotation(annotationId: string, reason: string) {
     const db = getDb(workspacePath);
     const { clientSlug } = getWorkspaceSessionScope();
     const local =
-      dbFindFeedbackByProviderAnnotation(db, "agentation", annotationId, clientSlug) ??
-      dbLoadFeedback(db, annotationId);
+      dbFindFeedbackByProviderAnnotation(db, "agentation", targetId, clientSlug) ??
+      (auth.localFeedbackId
+        ? dbLoadFeedback(db, auth.localFeedbackId)
+        : dbLoadFeedback(db, annotationId));
     if (local) {
       dbUpdateFeedbackLifecycle(db, local.id, {
         status: "dismissed",
@@ -1397,8 +1577,10 @@ async function handleReplyAnnotation(annotationId: string, message: string) {
   }
 
   try {
+    const targetId = auth.upstreamAnnotationId ?? annotationId;
+
     const res = await fetch(
-      `${AGENTATION_BASE}/annotations/${annotationId}/thread`,
+      `${AGENTATION_BASE}/annotations/${targetId}/thread`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1536,26 +1718,50 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     }
 
     try {
-      const allPending = await fetchScopedPendingAnnotations();
+      const result = await fetchScopedPendingAnnotations();
+      if (
+        result.failedSessions.length > 0 &&
+        result.successSessions.length === 0
+      ) {
+        return {
+          contents: [
+            {
+              uri,
+              mimeType: "application/json",
+              text: JSON.stringify({
+                annotations: [],
+                error: `Failed to retrieve annotations from mapped sessions: ${result.failedSessions.map((f) => `${f.sessionId} (${f.error})`).join(", ")}`,
+              }),
+            },
+          ],
+        };
+      }
+
       return {
         contents: [
           {
             uri,
             mimeType: "application/json",
             text: JSON.stringify({
-              annotations: allPending,
-              count: allPending.length,
+              annotations: result.annotations,
+              count: result.annotations.length,
+              ...(result.failedSessions.length > 0
+                ? { partial: true, failedSessions: result.failedSessions }
+                : {}),
             }),
           },
         ],
       };
-    } catch {
+    } catch (err) {
       return {
         contents: [
           {
             uri,
             mimeType: "application/json",
-            text: JSON.stringify({ annotations: [] }),
+            text: JSON.stringify({
+              annotations: [],
+              error: `Retrieval error: ${(err as Error).message}`,
+            }),
           },
         ],
       };

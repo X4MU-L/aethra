@@ -17,12 +17,14 @@ import {
   getAllProviderStatus,
 } from "../../visual-feedback/manager.js";
 import { getProvider } from "../../visual-feedback/providers/registry.js";
+import type { VisualFeedbackProvider } from "../../visual-feedback/providers/base.js";
 import { logger } from "../../core/logger.js";
 import { toAethraError } from "../../core/errors.js";
 import {
   getDb,
   dbGetSessionsForClient,
   dbSaveSessionMapping,
+  dbRemoveSessionMapping,
   dbFindFeedbackByProviderAnnotation,
 } from "../../engine/db.js";
 
@@ -113,11 +115,17 @@ export function registerFeedbackCommand(program: Command): void {
         const result = await importFeedback(workspacePath, slug, providerName);
 
         if (result.imported.length === 0) {
-          console.log(chalk.gray("  No new feedback to import.\n"));
+          console.log(chalk.gray("  No feedback annotations found.\n"));
+        } else if (result.newCount === 0 && result.updatedCount === 0) {
+          console.log(
+            chalk.gray(
+              `  All ${result.imported.length} annotation(s) are already imported and up-to-date.\n`,
+            ),
+          );
         } else {
           console.log(
             chalk.green(
-              `  ${chalk.bold(String(result.imported.length))} item(s) imported:\n`,
+              `  ${result.newCount} new item(s) imported, ${result.updatedCount} updated (${result.unchangedCount} unchanged):\n`,
             ),
           );
           for (const item of result.imported) {
@@ -500,15 +508,10 @@ export function registerFeedbackCommand(program: Command): void {
           return;
         }
 
-        // Resolve or create explicit session mapping
+        // Resolve explicit session mapping if one already exists
         const db = getDb(workspacePath);
         const existingSessions = dbGetSessionsForClient(db, config.slug);
-        let activeSessionId = existingSessions[0];
-        if (!activeSessionId) {
-          const crypto = await import("crypto");
-          activeSessionId = crypto.randomBytes(8).toString("hex");
-          dbSaveSessionMapping(db, activeSessionId, config.slug, workspacePath);
-        }
+        const activeSessionId = existingSessions[0];
 
         // Check if repository path is configured
         const repoPath = config.repositoryPath;
@@ -555,14 +558,34 @@ export function registerFeedbackCommand(program: Command): void {
 
         console.log(
           chalk.cyan(
-            `  ${alreadyInstalled ? "1" : "2"}. Add the toolbar to your app root with the client's mapped sessionId:\n`,
+            `  ${alreadyInstalled ? "1" : "2"}. Add the toolbar to your app root:\n`,
           ),
         );
-        console.log(
-          chalk.gray(
-            `     import { Agentation } from "agentation";\n\n     function App() {\n       return (\n         <>\n           <YourApp />\n           {process.env.NODE_ENV === "development" && (\n             <Agentation\n               endpoint="http://localhost:${port}"\n               sessionId="${activeSessionId}"\n             />\n           )}\n         </>\n       );\n     }\n`,
-          ),
-        );
+
+        if (activeSessionId) {
+          console.log(
+            chalk.gray(
+              `     import { Agentation } from "agentation";\n\n     function App() {\n       return (\n         <>\n           <YourApp />\n           {process.env.NODE_ENV === "development" && (\n             <Agentation\n               endpoint="http://localhost:${port}"\n               sessionId="${activeSessionId}"\n             />\n           )}\n         </>\n       );\n     }\n`,
+            ),
+          );
+          console.log(
+            chalk.gray(
+              `     (Using mapped session "${activeSessionId}" for client "${config.slug}")\n`,
+            ),
+          );
+        } else {
+          console.log(
+            chalk.gray(
+              `     import { Agentation } from "agentation";\n\n     function App() {\n       return (\n         <>\n           <YourApp />\n           {process.env.NODE_ENV === "development" && (\n             <Agentation\n               endpoint="http://localhost:${port}"\n               // Once 'aethra feedback watch' runs, pass its provisioned sessionId:\n               // sessionId="<active-session-id>"\n               // Or dynamically register browser-created sessions:\n               // onSessionCreated={(s) => { ... }}\n             />\n           )}\n         </>\n       );\n     }\n`,
+            ),
+          );
+          console.log(
+            chalk.yellow(
+              `     Notice: No session is mapped yet. Run 'aethra feedback watch --provider agentation --client ${config.slug}'\n` +
+              `     to start the server and provision a verified session, or register a browser session with 'register-session'.\n`,
+            ),
+          );
+        }
 
         console.log(
           chalk.cyan(
@@ -619,6 +642,26 @@ export function registerFeedbackCommand(program: Command): void {
       try {
         const { config, workspacePath } =
           await resolveClientWorkspace(clientSlug);
+
+        // If Agentation provider is reachable, verify session existence upstream
+        const agProvider = getProvider("agentation") as
+          | (VisualFeedbackProvider & {
+              validateSession?: (id: string) => Promise<boolean>;
+            })
+          | undefined;
+        if (agProvider && typeof agProvider.validateSession === "function") {
+          const avail = await agProvider.checkAvailability();
+          if (avail.connected) {
+            const valid = await agProvider.validateSession(sessionId);
+            if (!valid) {
+              logger.error(
+                `Cannot register session: session "${sessionId}" does not exist on Agentation server (HTTP 404).`,
+              );
+              process.exit(1);
+            }
+          }
+        }
+
         const db = getDb(workspacePath);
         dbSaveSessionMapping(db, sessionId, config.slug, workspacePath);
 
@@ -643,6 +686,11 @@ export function registerFeedbackCommand(program: Command): void {
     .option("--interval <seconds>", "Polling interval in seconds", "10")
     .option("--port <port>", "Agentation server port", "4747")
     .option("--client <slug>", "Specify client by slug")
+    .option("--session <id>", "Specific session ID to watch / bind")
+    .option(
+      "--new-session",
+      "Force creation of a new upstream session instead of reusing existing",
+    )
     .action(async (opts, cmd) => {
       const clientSlug = opts.client ?? cmd.parent?.parent?.opts()?.client;
 
@@ -681,6 +729,7 @@ export function registerFeedbackCommand(program: Command): void {
             setContext: (wp: string) => void;
             startServer: (port: number) => Promise<void>;
             stopServer: () => Promise<void>;
+            validateSession?: (sessionId: string) => Promise<boolean>;
             subscribeToEvents: (
               cb: (ann: Record<string, unknown>) => void | Promise<void>,
               clientSlug?: string,
@@ -730,25 +779,76 @@ export function registerFeedbackCommand(program: Command): void {
             (isLocal(config.primaryUrl) ? config.primaryUrl : undefined) ??
             "http://localhost:3000";
 
-          // Create a session mapping so retrievePending can find annotations
-          const crypto = await import("crypto");
-          const proposedSessionId = crypto.randomBytes(8).toString("hex");
+          let activeSessionId: string | null = null;
+          const db = getDb(workspacePath);
 
-          const sessionResult = await provider.startSession({
-            pageUrl,
-            clientSlug: slug,
-            sessionId: proposedSessionId,
-          });
-
-          if (!sessionResult.success) {
-            logger.error(
-              `Failed to create Agentation session: ${sessionResult.error ?? "unknown error"}`,
-            );
-            await agProvider.stopServer().catch(() => {});
-            process.exit(1);
+          if (opts.session) {
+            // User requested an explicit session
+            const valid =
+              typeof agProvider.validateSession === "function"
+                ? await agProvider.validateSession(opts.session)
+                : true;
+            if (!valid) {
+              logger.error(
+                `Specified session "${opts.session}" does not exist on Agentation server (HTTP 404).`,
+              );
+              await agProvider.stopServer().catch(() => {});
+              process.exit(1);
+            }
+            try {
+              dbSaveSessionMapping(db, opts.session, slug, workspacePath);
+              activeSessionId = opts.session;
+              logger.info(
+                `Bound explicit session "${activeSessionId}" to client "${slug}"`,
+              );
+            } catch (mapErr) {
+              logger.error(
+                `Session mapping failed: ${(mapErr as Error).message}`,
+              );
+              await agProvider.stopServer().catch(() => {});
+              process.exit(1);
+            }
+          } else if (!opts.newSession) {
+            // Reuse existing valid mapped session if available
+            const existingSessions = dbGetSessionsForClient(db, slug);
+            for (const existingId of existingSessions) {
+              const valid =
+                typeof agProvider.validateSession === "function"
+                  ? await agProvider.validateSession(existingId)
+                  : true;
+              if (valid) {
+                activeSessionId = existingId;
+                logger.info(
+                  `Reusing active mapped session "${activeSessionId}"`,
+                );
+                break;
+              } else {
+                logger.warn(
+                  `Mapped session "${existingId}" is stale (not found upstream); cleaning up.`,
+                );
+                dbRemoveSessionMapping(db, existingId);
+              }
+            }
           }
 
-          const activeSessionId = sessionResult.sessionId ?? proposedSessionId;
+          if (!activeSessionId) {
+            // Create a real session on the upstream server
+            const sessionResult = await provider.startSession({
+              pageUrl,
+              clientSlug: slug,
+            });
+
+            if (!sessionResult.success || !sessionResult.sessionId) {
+              logger.error(
+                `Failed to create Agentation session: ${sessionResult.error ?? "unknown error"}`,
+              );
+              await agProvider.stopServer().catch(() => {});
+              process.exit(1);
+            }
+
+            activeSessionId = sessionResult.sessionId;
+          }
+
           console.log(chalk.gray(`  Session: ${activeSessionId} → ${pageUrl}`));
           console.log(
             chalk.cyan(
@@ -784,15 +884,36 @@ export function registerFeedbackCommand(program: Command): void {
                 rawAnnotation as { id: string; [key: string]: unknown },
                 slug,
               );
-              const db = getDb(workspacePath);
+              const currentDb = getDb(workspacePath);
               const existing = feedback.providerAnnotationId
                 ? dbFindFeedbackByProviderAnnotation(
-                    db,
+                    currentDb,
                     feedback.provider,
                     feedback.providerAnnotationId,
                     feedback.clientId,
                   )
                 : null;
+
+              if (existing) {
+                feedback.id = existing.id;
+                feedback.status = existing.status;
+                feedback.taskId = existing.taskId;
+                feedback.resolutionSummary = existing.resolutionSummary;
+                if (
+                  existing.relatedFindingIds?.length &&
+                  (!feedback.relatedFindingIds ||
+                    feedback.relatedFindingIds.length === 0)
+                ) {
+                  feedback.relatedFindingIds = existing.relatedFindingIds;
+                }
+                if (
+                  existing.relatedFeedbackIds?.length &&
+                  (!feedback.relatedFeedbackIds ||
+                    feedback.relatedFeedbackIds.length === 0)
+                ) {
+                  feedback.relatedFeedbackIds = existing.relatedFeedbackIds;
+                }
+              }
 
               await saveFeedback(workspacePath, feedback);
 

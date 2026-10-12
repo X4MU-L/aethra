@@ -68,6 +68,7 @@ export async function importFeedback(
   errors: string[];
   newCount: number;
   updatedCount: number;
+  unchangedCount: number;
 }> {
   const provider = getProvider(providerName);
   if (!provider) {
@@ -129,6 +130,7 @@ export async function importFeedback(
   const db = getDb(workspacePath);
   let newCount = 0;
   let updatedCount = 0;
+  let unchangedCount = 0;
 
   for (const raw of rawAnnotations) {
     try {
@@ -150,6 +152,31 @@ export async function importFeedback(
           feedback.status = existing.status;
           feedback.taskId = existing.taskId;
           feedback.resolutionSummary = existing.resolutionSummary;
+          if (
+            existing.relatedFindingIds?.length &&
+            (!feedback.relatedFindingIds || feedback.relatedFindingIds.length === 0)
+          ) {
+            feedback.relatedFindingIds = existing.relatedFindingIds;
+          }
+          if (
+            existing.relatedFeedbackIds?.length &&
+            (!feedback.relatedFeedbackIds || feedback.relatedFeedbackIds.length === 0)
+          ) {
+            feedback.relatedFeedbackIds = existing.relatedFeedbackIds;
+          }
+
+          const isUpdated =
+            existing.comment !== feedback.comment ||
+            existing.severity !== feedback.severity ||
+            existing.kind !== feedback.kind ||
+            existing.elementSelector !== feedback.elementSelector ||
+            existing.pageUrl !== feedback.pageUrl;
+
+          if (isUpdated) {
+            updatedCount++;
+          } else {
+            unchangedCount++;
+          }
         }
       }
 
@@ -157,8 +184,6 @@ export async function importFeedback(
       imported.push(feedback);
       if (isNew) {
         newCount++;
-      } else {
-        updatedCount++;
       }
     } catch (err) {
       errors.push(
@@ -168,13 +193,13 @@ export async function importFeedback(
   }
 
   logger.info(
-    `Imported ${imported.length} feedback items from ${providerName} (${newCount} new, ${updatedCount} updated)`,
+    `Imported ${imported.length} feedback items from ${providerName} (${newCount} new, ${updatedCount} updated, ${unchangedCount} unchanged)`,
   );
   if (errors.length > 0) {
     logger.warn(`${errors.length} import errors`);
   }
 
-  return { imported, errors, newCount, updatedCount };
+  return { imported, errors, newCount, updatedCount, unchangedCount };
 }
 
 // ─── Lifecycle operations ────────────────────────────────────────────────────

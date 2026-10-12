@@ -322,7 +322,142 @@ describe("Cross-workspace security isolation", () => {
     );
 
     expect(dismissed.status).toBe("dismissed");
-    expect(dismissed.resolutionSummary).toBe("Dismissed: Not a bug, intentional design");
+    expect(dismissed.resolutionSummary).toBe(
+      "Dismissed: Not a bug, intentional design",
+    );
     expect(dismissed.upstreamSynced).toBe(true);
+  });
+
+  it("AgentationProvider.processSSEEvent supports session-scoped inheritance and rejects conflicting stream session IDs", () => {
+    const dbA = getDb(workspaceA);
+    dbSaveSessionMapping(dbA, "session-alpha", "client-a", workspaceA);
+
+    const provider = new AgentationProvider();
+    provider.setContext(workspaceA);
+
+    const received: Array<{ id?: string; _sessionId?: string }> = [];
+    const callback = (ann: unknown) =>
+      received.push(ann as { id?: string; _sessionId?: string });
+
+    // 1. Session-scoped stream event without explicit sessionId inherits stream session ID
+    const scopedEvent = {
+      type: "annotation.created",
+      payload: { id: "ann-scoped-1", comment: "Scoped annotation" },
+    };
+    const acceptedScoped = provider.processSSEEvent(
+      scopedEvent,
+      callback,
+      "client-a",
+      "session-alpha",
+    );
+    expect(acceptedScoped).toBe(true);
+    expect(received).toHaveLength(1);
+    expect(received[0]?._sessionId).toBe("session-alpha");
+
+    // 2. Event with conflicting sessionId on scoped stream must fail closed
+    const conflictEvent = {
+      type: "annotation.created",
+      sessionId: "session-other",
+      payload: { id: "ann-conflict", comment: "Mismatched session" },
+    };
+    const acceptedConflict = provider.processSSEEvent(
+      conflictEvent,
+      callback,
+      "client-a",
+      "session-alpha",
+    );
+    expect(acceptedConflict).toBe(false);
+    expect(received).toHaveLength(1);
+  });
+
+  it("importFeedback accurately tracks newCount, updatedCount, and unchangedCount", async () => {
+    const itemDir = path.join(workspaceA, "feedback", "items");
+    await fs.ensureDir(itemDir);
+
+    const raw1 = {
+      id: "ann-counter-1",
+      comment: "Initial comment",
+      pageUrl: "http://localhost:3000",
+      selector: "button.submit",
+    };
+    await fs.writeJson(path.join(itemDir, "item-1.json"), raw1);
+
+    // First import: 1 new
+    const res1 = await importFeedback(workspaceA, "client-a", "manual");
+    expect(res1.newCount).toBe(1);
+    expect(res1.updatedCount).toBe(0);
+    expect(res1.unchangedCount).toBe(0);
+    expect(res1.imported).toHaveLength(1);
+
+    // Second import identical: 0 new, 0 updated, 1 unchanged
+    const res2 = await importFeedback(workspaceA, "client-a", "manual");
+    expect(res2.newCount).toBe(0);
+    expect(res2.updatedCount).toBe(0);
+    expect(res2.unchangedCount).toBe(1);
+
+    // Third import modified comment: 0 new, 1 updated, 0 unchanged
+    const rawModified = {
+      ...raw1,
+      comment: "Updated comment text",
+    };
+    await fs.writeJson(path.join(itemDir, "item-1.json"), rawModified);
+
+    const res3 = await importFeedback(workspaceA, "client-a", "manual");
+    expect(res3.newCount).toBe(0);
+    expect(res3.updatedCount).toBe(1);
+    expect(res3.unchangedCount).toBe(0);
+  });
+
+  it("startSession rejects non-existent explicit sessionId upstream", async () => {
+    const provider = new AgentationProvider();
+    provider.setContext(workspaceA);
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/sessions/nonexistent-session")) {
+        return new Response(JSON.stringify({ error: "Session not found" }), {
+          status: 404,
+        });
+      }
+      return origFetch(url);
+    }) as typeof fetch;
+
+    try {
+      const res = await provider.startSession({
+        pageUrl: "http://localhost:3000",
+        clientSlug: "client-a",
+        sessionId: "nonexistent-session",
+      });
+      expect(res.success).toBe(false);
+      expect(res.error).toContain("does not exist on Agentation server");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("MCP ownership check rejects unmapped, empty, or cross-workspace sessions", async () => {
+    const dbA = getDb(workspaceA);
+    dbSaveSessionMapping(dbA, "session-alpha", "client-a", workspaceA);
+
+    // Record without any sessionId
+    const fbNoSession = VisualFeedbackSchema.parse({
+      id: "fb-missing-session",
+      provider: "agentation",
+      providerAnnotationId: "ann-no-sess",
+      clientId: "client-a",
+      sessionId: "",
+      pageUrl: "http://localhost:3000",
+      comment: "Missing session ID",
+      createdAt: new Date().toISOString(),
+    });
+    dbSaveFeedback(dbA, fbNoSession);
+
+    const authNoSession = await checkAnnotationWorkspaceOwnership(
+      workspaceA,
+      "fb-missing-session",
+    );
+    expect(authNoSession.authorized).toBe(false);
+    expect(authNoSession.reason).toContain("no associated session ID");
   });
 });

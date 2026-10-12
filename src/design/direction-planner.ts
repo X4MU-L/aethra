@@ -234,7 +234,13 @@ export function planDesignDirections(
   count?: number,
   seed?: number,
 ): DesignDirection[] {
-  const directions = generateDesignDirections(count ?? 4, seed);
+  const safeCount =
+    typeof count === "number" && !isNaN(count) && count > 0
+      ? Math.max(1, Math.min(Math.floor(count), 50))
+      : 4;
+  const safeSeed =
+    typeof seed === "number" && !isNaN(seed) ? seed : undefined;
+
   const constraints = clientFacts?.constraints ?? [];
   const outcomes = clientFacts?.desiredOutcomes ?? [];
 
@@ -260,10 +266,11 @@ export function planDesignDirections(
     }
   }
 
-  const filtered = directions.filter((dir) => {
+  const allCombos = allCombinations();
+  const validCombos = allCombos.filter((combo) => {
     if (prohibitedWords.length === 0) return true;
-    for (const axis of dir.axes) {
-      const positionWords = axis.position.toLowerCase().split("-");
+    for (const pos of combo) {
+      const positionWords = pos.toLowerCase().split("-");
       for (const word of positionWords) {
         if (prohibitedWords.includes(word) && word.length > 2) {
           return false;
@@ -273,12 +280,53 @@ export function planDesignDirections(
     return true;
   });
 
-  // If constraints eliminate all candidate directions, explain the conflict rather than silently restoring prohibited directions
-  if (prohibitedWords.length > 0 && filtered.length === 0) {
+  // If constraints eliminate all candidate directions, return empty array without falling back
+  if (prohibitedWords.length > 0 && validCombos.length === 0) {
     return [];
   }
 
-  const candidates = [...filtered];
+  // Select up to safeCount diverse directions from validCombos
+  const rng = mulberry32(safeSeed ?? Date.now());
+  const firstIdx = Math.floor(rng() * validCombos.length);
+  const selected: string[][] = [validCombos[firstIdx]!];
+
+  for (let i = 1; i < safeCount && i < validCombos.length; i++) {
+    let bestCombo: string[] | undefined;
+    let bestMinDist = -1;
+
+    for (const combo of validCombos) {
+      if (selected.some((s) => hammingDistance(s, combo) === 0)) continue;
+
+      const minDist = Math.min(
+        ...selected.map((s) => hammingDistance(s, combo)),
+      );
+      if (minDist > bestMinDist) {
+        bestMinDist = minDist;
+        bestCombo = combo;
+      }
+    }
+
+    if (bestCombo) {
+      selected.push(bestCombo);
+    }
+  }
+
+  const candidates = selected.map((positions) => {
+    const id = crypto.randomBytes(8).toString("hex");
+    const axes = AXIS_NAMES.map((axisName, idx) => ({
+      axis: axisName,
+      position: positions[idx]!,
+      description:
+        AXIS_DESCRIPTIONS[axisName]?.[positions[idx]!] ?? positions[idx]!,
+    }));
+
+    return {
+      id,
+      name: synthesizeName(positions),
+      axes,
+      rationale: `Direction combining ${positions.slice(0, 3).join(", ")} for a distinctive visual approach.`,
+    };
+  });
 
   // Derive task affinity signals to meaningfully bias ranking toward task requirements
   const taskLower = taskDescription.toLowerCase();
@@ -328,9 +376,6 @@ export function planDesignDirections(
       dir.axes.find((a) => a.axis === "color-temperature")?.position ??
       "balanced";
 
-    const taskContext = taskDescription.trim()
-      ? ` Tailored to task "${taskDescription.slice(0, 80)}".`
-      : "";
     const outcomeNote =
       outcomes.length > 0
         ? ` Aims to advance client outcomes: ${outcomes.slice(0, 2).join("; ")}.`
@@ -342,6 +387,12 @@ export function planDesignDirections(
         alignmentReasons.push(`${ax.axis} (${ax.position})`);
       }
     }
+
+    const taskContext =
+      alignmentReasons.length > 0 && taskDescription.trim()
+        ? ` Tailored to task "${taskDescription.slice(0, 80)}".`
+        : "";
+
     const alignmentNote =
       alignmentReasons.length > 0
         ? ` Directly aligns with task requirements via ${alignmentReasons.join(", ")}.`
