@@ -99,12 +99,46 @@ export function clearGlobalRegistry(): void {
   db.exec("DELETE FROM session_ownership;");
 }
 
+/** Normalize a workspace path to a canonical absolute path, safely resolving symlinks. */
+export function normalizeWorkspacePath(wsPath: string): string {
+  try {
+    const resolved = path.resolve(wsPath);
+    if (fs.existsSync(resolved)) {
+      try {
+        return fs.realpathSync.native(resolved);
+      } catch {
+        return fs.realpathSync(resolved);
+      }
+    }
+    // Resolve symlinks on existing ancestor directory if wsPath does not exist yet
+    let current = resolved;
+    const segments: string[] = [];
+    while (current !== path.dirname(current)) {
+      if (fs.existsSync(current)) {
+        try {
+          const realParent = fs.realpathSync.native(current);
+          return path.join(realParent, ...segments);
+        } catch {
+          const realParent = fs.realpathSync(current);
+          return path.join(realParent, ...segments);
+        }
+      }
+      segments.unshift(path.basename(current));
+      current = path.dirname(current);
+    }
+    return resolved;
+  } catch {
+    return path.resolve(wsPath);
+  }
+}
+
 /**
  * Claim exclusive ownership of an upstream Agentation session for a client workspace.
  *
  * Invariant: Atomic check and claim using an IMMEDIATE SQLite transaction.
  * - If unowned: claims session and records ownership.
- * - If already owned by same clientSlug: succeeds idempotently, updating workspacePath and updatedAt.
+ * - If already owned by same clientSlug AND same canonical workspace: succeeds idempotently.
+ * - If owned by same clientSlug but different workspace: throws VisualFeedbackError (no silent transfer).
  * - If owned by another client: throws VisualFeedbackError and makes no modification.
  */
 export function claimSessionOwnership(
@@ -113,6 +147,7 @@ export function claimSessionOwnership(
   workspacePath: string,
 ): { claimed: boolean; existing: boolean } {
   const db = getGlobalRegistryDb();
+  const canonicalPath = normalizeWorkspacePath(workspacePath);
 
   const claimTx = db.transaction(
     (sessionId: string, slug: string, wsPath: string) => {
@@ -131,12 +166,21 @@ export function claimSessionOwnership(
         | undefined;
 
       if (existing) {
-        if (existing.client_slug === slug) {
-          // Idempotent: already owned by this client. Update workspace path and timestamp.
+        const existingCanonical = normalizeWorkspacePath(existing.workspace_path);
+
+        if (existing.client_slug === slug && existingCanonical === wsPath) {
+          // Idempotent: already owned by this client and this exact workspace.
           db.prepare(
-            "UPDATE session_ownership SET workspace_path = ?, updated_at = ? WHERE agentation_session_id = ?",
-          ).run(wsPath, new Date().toISOString(), sessionId);
+            "UPDATE session_ownership SET updated_at = ? WHERE agentation_session_id = ?",
+          ).run(new Date().toISOString(), sessionId);
           return { claimed: true, existing: true };
+        }
+
+        if (existing.client_slug === slug && existingCanonical !== wsPath) {
+          // Same client slug but different workspace path: reject silent transfer!
+          throw new VisualFeedbackError(
+            `Agentation session "${sessionId}" is already owned by client "${slug}" in workspace "${existing.workspace_path}" and cannot be claimed by workspace "${wsPath}".`,
+          );
         }
 
         // Owned by a different client across the installation!
@@ -155,27 +199,28 @@ export function claimSessionOwnership(
     },
   );
 
-  return claimTx.immediate(agentationSessionId, clientSlug, workspacePath);
+  return claimTx.immediate(agentationSessionId, clientSlug, canonicalPath);
 }
 
 /**
  * Safely release session ownership for a client.
  *
- * Invariant: A client can only release its own session.
- * Attempting to release a session owned by another client fails safely.
+ * Invariant: A client can only release its own session from the rightful workspace.
+ * Attempting to release a session owned by another client or different workspace fails safely.
  */
 export function releaseSessionOwnership(
   agentationSessionId: string,
   clientSlug: string,
+  workspacePath?: string,
 ): boolean {
   const db = getGlobalRegistryDb();
 
-  const releaseTx = db.transaction((sessionId: string, slug: string) => {
+  const releaseTx = db.transaction((sessionId: string, slug: string, wsPath?: string) => {
     const existing = db
       .prepare(
-        "SELECT client_slug FROM session_ownership WHERE agentation_session_id = ?",
+        "SELECT client_slug, workspace_path FROM session_ownership WHERE agentation_session_id = ?",
       )
-      .get(sessionId) as { client_slug: string } | undefined;
+      .get(sessionId) as { client_slug: string; workspace_path: string } | undefined;
 
     if (!existing) {
       return false;
@@ -188,13 +233,24 @@ export function releaseSessionOwnership(
       return false;
     }
 
+    if (wsPath) {
+      const canonicalReq = normalizeWorkspacePath(wsPath);
+      const canonicalOwner = normalizeWorkspacePath(existing.workspace_path);
+      if (canonicalReq !== canonicalOwner) {
+        logger.warn(
+          `Security: workspace "${canonicalReq}" attempted to release session "${sessionId}" owned by workspace "${canonicalOwner}"`,
+        );
+        return false;
+      }
+    }
+
     db.prepare(
       "DELETE FROM session_ownership WHERE agentation_session_id = ?",
     ).run(sessionId);
     return true;
   });
 
-  return releaseTx.immediate(agentationSessionId, clientSlug);
+  return releaseTx.immediate(agentationSessionId, clientSlug, workspacePath);
 }
 
 /** Get current owner of a session across the installation. */
@@ -227,14 +283,113 @@ export function getGlobalSessionOwner(
 }
 
 /**
+ * Authoritative session authorization check.
+ *
+ * Invariants:
+ * 1. Global ownership record exists.
+ * 2. Registry record's owner matches the current workspace identity.
+ * 3. Registry record's client identity matches the current client.
+ * 4. Workspace-local session mapping exists and agrees with the global record (if localDb supplied).
+ */
+export function verifySessionAuthorization(
+  sessionId: string,
+  clientSlug: string,
+  workspacePath: string,
+  localDb?: Database.Database,
+): { authorized: boolean; reason?: string } {
+  if (!sessionId || !clientSlug || !workspacePath) {
+    return {
+      authorized: false,
+      reason: "Missing session ID, client slug, or workspace path for authorization check",
+    };
+  }
+
+  // 1. Check global ownership record
+  const globalOwner = getGlobalSessionOwner(sessionId);
+  if (!globalOwner) {
+    return {
+      authorized: false,
+      reason: `No global ownership claim exists for session "${sessionId}"`,
+    };
+  }
+
+  // 2. Check canonical workspace identity
+  const currentCanonical = normalizeWorkspacePath(workspacePath);
+  const ownerCanonical = normalizeWorkspacePath(globalOwner.workspacePath);
+  if (currentCanonical !== ownerCanonical) {
+    return {
+      authorized: false,
+      reason: `Session "${sessionId}" is globally owned by workspace "${globalOwner.workspacePath}", not "${workspacePath}"`,
+    };
+  }
+
+  // 3. Check client identity
+  if (globalOwner.clientSlug !== clientSlug) {
+    return {
+      authorized: false,
+      reason: `Session "${sessionId}" is globally owned by client "${globalOwner.clientSlug}", not "${clientSlug}"`,
+    };
+  }
+
+  // 4. Check workspace-local mapping
+  if (localDb) {
+    try {
+      const row = localDb
+        .prepare(
+          "SELECT client_slug FROM session_mappings WHERE agentation_session_id = ?",
+        )
+        .get(sessionId) as { client_slug: string } | undefined;
+
+      if (!row) {
+        return {
+          authorized: false,
+          reason: `Session "${sessionId}" is not mapped in workspace-local database`,
+        };
+      }
+
+      if (row.client_slug !== clientSlug) {
+        return {
+          authorized: false,
+          reason: `Session "${sessionId}" is locally mapped to client "${row.client_slug}", conflicting with "${clientSlug}"`,
+        };
+      }
+    } catch (err) {
+      return {
+        authorized: false,
+        reason: `Failed to verify workspace-local session mapping: ${(err as Error).message}`,
+      };
+    }
+  }
+
+  return { authorized: true };
+}
+
+/**
  * Synchronize legacy session mappings into the global registry during initialization.
  * Ensures workspaces created prior to the global registry are safely registered.
+ *
+ * Conflict Policy:
+ * 1. If mapping matches global registry or session is unowned: preserved.
+ * 2. If global registry identifies another owner: immediately quarantines conflicting
+ *    local mapping from session_mappings so it cannot authorize access.
+ * 3. Records diagnostics in quarantined_session_mappings for operator inspection.
  */
 export function syncLegacySessionMappings(
   localDb: Database.Database,
   workspacePath: string,
 ): void {
   try {
+    localDb.exec(`
+      CREATE TABLE IF NOT EXISTS quarantined_session_mappings (
+        agentation_session_id TEXT PRIMARY KEY,
+        client_slug TEXT NOT NULL,
+        workspace_path TEXT NOT NULL,
+        conflicted_owner TEXT NOT NULL,
+        quarantined_at TEXT NOT NULL,
+        reason TEXT NOT NULL
+      );
+    `);
+
     const rows = localDb
       .prepare(
         "SELECT agentation_session_id, client_slug, workspace_path FROM session_mappings",
@@ -245,17 +400,56 @@ export function syncLegacySessionMappings(
       workspace_path: string;
     }>;
 
+    const canonicalCurrent = normalizeWorkspacePath(workspacePath);
+
     for (const row of rows) {
-      try {
-        claimSessionOwnership(
+      const existingOwner = getGlobalSessionOwner(row.agentation_session_id);
+
+      if (existingOwner) {
+        const canonicalOwner = normalizeWorkspacePath(existingOwner.workspacePath);
+        const matchesClient = existingOwner.clientSlug === row.client_slug;
+        const matchesWorkspace = canonicalOwner === canonicalCurrent;
+
+        if (matchesClient && matchesWorkspace) {
+          // Ownership matches and is consistent
+          continue;
+        }
+
+        // Conflict: owned by another client or different workspace!
+        // Prevent unauthorized access by immediately removing from local active session_mappings
+        localDb.prepare(
+          "DELETE FROM session_mappings WHERE agentation_session_id = ?",
+        ).run(row.agentation_session_id);
+
+        localDb.prepare(
+          `INSERT OR REPLACE INTO quarantined_session_mappings
+           (agentation_session_id, client_slug, workspace_path, conflicted_owner, quarantined_at, reason)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        ).run(
           row.agentation_session_id,
           row.client_slug,
           row.workspace_path || workspacePath,
+          JSON.stringify(existingOwner),
+          new Date().toISOString(),
+          `Conflict with global owner: client "${existingOwner.clientSlug}" in "${existingOwner.workspacePath}"`,
         );
-      } catch (err) {
-        logger.debug(
-          `Legacy session sync skipped for ${row.agentation_session_id}: ${(err as Error).message}`,
+
+        logger.warn(
+          `Legacy session conflict: quarantined local mapping for "${row.agentation_session_id}" (conflicted with ${existingOwner.clientSlug} in ${existingOwner.workspacePath}). Remediation: register a new session or inspect quarantined_session_mappings.`,
         );
+      } else {
+        // Unclaimed session: attempt to claim for this workspace
+        try {
+          claimSessionOwnership(
+            row.agentation_session_id,
+            row.client_slug,
+            row.workspace_path || workspacePath,
+          );
+        } catch (err) {
+          logger.debug(
+            `Legacy session sync skipped for ${row.agentation_session_id}: ${(err as Error).message}`,
+          );
+        }
       }
     }
   } catch {

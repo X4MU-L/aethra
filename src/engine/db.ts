@@ -18,6 +18,7 @@ import {
   releaseSessionOwnership,
   closeGlobalRegistry,
   syncLegacySessionMappings,
+  normalizeWorkspacePath,
 } from "./session-registry.js";
 export {
   claimSessionOwnership,
@@ -26,6 +27,8 @@ export {
   setGlobalRegistryPath,
   clearGlobalRegistry,
   closeGlobalRegistry,
+  verifySessionAuthorization,
+  normalizeWorkspacePath,
 } from "./session-registry.js";
 import type {
   TaskRecord,
@@ -782,11 +785,13 @@ export function dbSaveSessionMapping(
   clientSlug: string,
   workspacePath: string,
 ): void {
+  const canonicalPath = normalizeWorkspacePath(workspacePath);
+
   // 1. Enforce global cross-workspace ownership first
   const claimResult = claimSessionOwnership(
     agentationSessionId,
     clientSlug,
-    workspacePath,
+    canonicalPath,
   );
 
   // 2. Enforce local client uniqueness constraint
@@ -799,7 +804,7 @@ export function dbSaveSessionMapping(
   if (existingLocal && existingLocal.client_slug !== clientSlug) {
     if (!claimResult.existing) {
       try {
-        releaseSessionOwnership(agentationSessionId, clientSlug);
+        releaseSessionOwnership(agentationSessionId, clientSlug, canonicalPath);
       } catch {
         // ignore
       }
@@ -819,13 +824,13 @@ export function dbSaveSessionMapping(
     ).run(
       agentationSessionId,
       clientSlug,
-      workspacePath,
+      canonicalPath,
       new Date().toISOString(),
     );
   } catch (err) {
     if (!claimResult.existing) {
       try {
-        releaseSessionOwnership(agentationSessionId, clientSlug);
+        releaseSessionOwnership(agentationSessionId, clientSlug, canonicalPath);
       } catch {
         // ignore
       }
@@ -875,6 +880,7 @@ export function dbRemoveSessionMapping(
   db: Database.Database,
   agentationSessionId: string,
   clientSlug?: string,
+  workspacePath?: string,
 ): void {
   // Determine client slug from local DB if not explicitly supplied
   const ownerSlug =
@@ -886,7 +892,7 @@ export function dbRemoveSessionMapping(
 
   // Safely release global ownership for this client without deleting other clients' sessions
   if (ownerSlug) {
-    releaseSessionOwnership(agentationSessionId, ownerSlug);
+    releaseSessionOwnership(agentationSessionId, ownerSlug, workspacePath);
   }
 }
 

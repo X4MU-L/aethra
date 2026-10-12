@@ -28,6 +28,8 @@ import {
   setGlobalRegistryPath,
   clearGlobalRegistry,
   getGlobalSessionOwner,
+  verifySessionAuthorization,
+  normalizeWorkspacePath,
 } from "../../src/engine/db.js";
 import { VisualFeedbackError } from "../../src/core/errors.js";
 import {
@@ -67,6 +69,9 @@ describe("Cross-workspace security isolation & session reliability", () => {
     await fs.ensureDir(workspaceA);
     await fs.ensureDir(workspaceB);
     await fs.ensureDir(aethraHome);
+
+    workspaceA = normalizeWorkspacePath(workspaceA);
+    workspaceB = normalizeWorkspacePath(workspaceB);
 
     // Create client configs
     await fs.writeFile(
@@ -630,5 +635,336 @@ describe("Cross-workspace security isolation & session reliability", () => {
     );
     expect(authNoSession.authorized).toBe(false);
     expect(authNoSession.reason).toContain("no associated session ID");
+  });
+
+  it("Two workspaces with the same client slug but different canonical paths cannot both claim the same session", async () => {
+    const workspaceAClone = path.join(tmpRoot, "client-a-clone");
+    await fs.ensureDir(workspaceAClone);
+    await fs.writeFile(
+      path.join(workspaceAClone, "client.yaml"),
+      "slug: client-a\nname: Client Alpha Clone\nprimaryUrl: http://localhost:5000\n",
+    );
+
+    const dbA = getDb(workspaceA);
+    const dbClone = getDb(workspaceAClone);
+    const sessionId = "session-same-slug-shared";
+
+    // Workspace A claims the session first
+    dbSaveSessionMapping(dbA, sessionId, "client-a", workspaceA);
+    expect(getGlobalSessionOwner(sessionId)?.workspacePath).toBe(
+      normalizeWorkspacePath(workspaceA),
+    );
+
+    // Workspace A Clone has the SAME slug "client-a", but different canonical path.
+    // It MUST be rejected and cannot silently overwrite ownership!
+    expect(() => {
+      dbSaveSessionMapping(dbClone, sessionId, "client-a", workspaceAClone);
+    }).toThrow(VisualFeedbackError);
+
+    // Verify Workspace A Clone has no local mapping
+    expect(dbIsSessionMapped(dbClone, sessionId, "client-a")).toBe(false);
+
+    // Global ownership MUST remain with Workspace A
+    const owner = getGlobalSessionOwner(sessionId);
+    expect(owner?.workspacePath).toBe(normalizeWorkspacePath(workspaceA));
+    expect(owner?.clientSlug).toBe("client-a");
+
+    closeDb(workspaceAClone);
+  });
+
+  it("A different workspace with the same client slug cannot release the rightful owner's claim", async () => {
+    const workspaceAClone = path.join(tmpRoot, "client-a-clone");
+    await fs.ensureDir(workspaceAClone);
+    await fs.writeFile(
+      path.join(workspaceAClone, "client.yaml"),
+      "slug: client-a\nname: Client Alpha Clone\nprimaryUrl: http://localhost:5000\n",
+    );
+
+    const dbA = getDb(workspaceA);
+    const dbClone = getDb(workspaceAClone);
+    const sessionId = "session-release-protection";
+
+    dbSaveSessionMapping(dbA, sessionId, "client-a", workspaceA);
+
+    // Workspace A Clone tries to release the session
+    dbRemoveSessionMapping(dbClone, sessionId, "client-a", workspaceAClone);
+
+    // Global claim must NOT be released!
+    const owner = getGlobalSessionOwner(sessionId);
+    expect(owner).not.toBeNull();
+    expect(owner?.workspacePath).toBe(normalizeWorkspacePath(workspaceA));
+
+    closeDb(workspaceAClone);
+  });
+
+  it("Canonical path normalization handles relative paths and symlinks consistently", async () => {
+    const dbA = getDb(workspaceA);
+    const sessionId = "session-canonical-symlink";
+
+    dbSaveSessionMapping(dbA, sessionId, "client-a", workspaceA);
+
+    // Create a symlink to workspaceA
+    const symlinkPath = path.join(tmpRoot, "symlink-to-client-a");
+    try {
+      await fs.symlink(workspaceA, symlinkPath, "dir");
+    } catch {
+      // If symlink not supported on platform, skip symlink portion
+    }
+
+    if (fs.existsSync(symlinkPath)) {
+      // Re-registering through the symlink points to the same canonical path
+      const canonicalSymlink = normalizeWorkspacePath(symlinkPath);
+      const canonicalReal = normalizeWorkspacePath(workspaceA);
+      expect(canonicalSymlink).toBe(canonicalReal);
+
+      // Re-registering should succeed idempotently
+      expect(() => {
+        dbSaveSessionMapping(dbA, sessionId, "client-a", symlinkPath);
+      }).not.toThrow();
+    }
+  });
+
+  it("Legacy migration preserves valid mappings and quarantines conflicting claims", () => {
+    const dbA = getDb(workspaceA);
+    // Workspace A legitimately owns session-conflicted
+    dbSaveSessionMapping(dbA, "session-conflicted", "client-a", workspaceA);
+
+    // Create legacy workspace C with a conflicting local mapping
+    const legacyWorkspace = path.join(tmpRoot, "legacy-conflicted-ws");
+    fs.ensureDirSync(path.join(legacyWorkspace, ".local"));
+
+    const Database = (getDb(workspaceA) as any).constructor;
+    const legacyDb = new Database(path.join(legacyWorkspace, ".local", "aethra.db"));
+    legacyDb.exec(`
+      CREATE TABLE IF NOT EXISTS session_mappings (
+        agentation_session_id TEXT PRIMARY KEY,
+        client_slug TEXT NOT NULL,
+        workspace_path TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO session_mappings VALUES ('session-conflicted', 'client-legacy', '${legacyWorkspace}', '2026-01-01T00:00:00Z');
+      INSERT INTO session_mappings VALUES ('session-unclaimed', 'client-legacy', '${legacyWorkspace}', '2026-01-01T00:00:00Z');
+    `);
+    legacyDb.close();
+
+    // Now open via getDb(legacyWorkspace) which runs syncLegacySessionMappings
+    const dbC = getDb(legacyWorkspace);
+
+    // Invariant: Conflicting session-conflicted MUST be quarantined and NOT present in session_mappings
+    expect(dbIsSessionMapped(dbC, "session-conflicted", "client-legacy")).toBe(false);
+
+    // Invariant: verifySessionAuthorization denies access for legacy workspace
+    const authConflict = verifySessionAuthorization(
+      "session-conflicted",
+      "client-legacy",
+      legacyWorkspace,
+      dbC,
+    );
+    expect(authConflict.authorized).toBe(false);
+    expect(authConflict.reason).toContain("globally owned by workspace");
+
+    // Invariant: Unclaimed session is preserved and claimed
+    expect(dbIsSessionMapped(dbC, "session-unclaimed", "client-legacy")).toBe(true);
+    expect(getGlobalSessionOwner("session-unclaimed")?.clientSlug).toBe("client-legacy");
+
+    // Invariant: Quarantined records table exists and contains diagnostic info
+    const quarantined = dbC
+      .prepare("SELECT * FROM quarantined_session_mappings WHERE agentation_session_id = ?")
+      .get("session-conflicted") as any;
+    expect(quarantined).toBeDefined();
+    expect(quarantined.client_slug).toBe("client-legacy");
+    expect(quarantined.reason).toContain("Conflict with global owner");
+
+    // Invariant: Repeating initialization is idempotent and safe
+    closeDb(legacyWorkspace);
+    const dbCReopen = getDb(legacyWorkspace);
+    expect(dbIsSessionMapped(dbCReopen, "session-conflicted", "client-legacy")).toBe(false);
+    closeDb(legacyWorkspace);
+  });
+
+  it("Local-only mapping without global registry claim is denied authorization", () => {
+    const dbA = getDb(workspaceA);
+
+    // Manually insert rogue local mapping bypassing global registry
+    dbA.prepare(
+      "INSERT OR REPLACE INTO session_mappings VALUES ('rogue-session', 'client-a', ?, ?)",
+    ).run(workspaceA, new Date().toISOString());
+
+    expect(dbIsSessionMapped(dbA, "rogue-session", "client-a")).toBe(true);
+
+    // Authoritative check must fail closed because no global ownership record exists!
+    const auth = verifySessionAuthorization(
+      "rogue-session",
+      "client-a",
+      workspaceA,
+      dbA,
+    );
+    expect(auth.authorized).toBe(false);
+    expect(auth.reason).toContain("No global ownership claim exists");
+  });
+
+  it("Cross-workspace authorization denied across all mutation endpoints and retrieval", async () => {
+    const dbA = getDb(workspaceA);
+    const dbB = getDb(workspaceB);
+
+    dbSaveSessionMapping(dbA, "session-owned-a", "client-a", workspaceA);
+    dbSaveSessionMapping(dbB, "session-owned-b", "client-b", workspaceB);
+
+    // Create feedback in Workspace A
+    const fbA: VisualFeedback = VisualFeedbackSchema.parse({
+      id: "fb-item-a",
+      provider: "agentation",
+      providerAnnotationId: "ann-a-100",
+      clientId: "client-a",
+      sessionId: "session-owned-a",
+      pageUrl: "http://localhost:3000",
+      comment: "Alpha only",
+      createdAt: new Date().toISOString(),
+    });
+    dbSaveFeedback(dbA, fbA);
+
+    // 1. Workspace B cannot authorize Workspace A's local feedback item
+    const authLocalFromB = await checkAnnotationWorkspaceOwnership(
+      workspaceB,
+      "fb-item-a",
+    );
+    expect(authLocalFromB.authorized).toBe(false);
+
+    // 2. Upstream check: Workspace B cannot authorize an upstream annotation from session-owned-a
+    const origFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        const urlStr = String(url);
+        if (urlStr.includes("/annotations/ann-upstream-test")) {
+          return new Response(
+            JSON.stringify({ id: "ann-upstream-test", sessionId: "session-owned-a" }),
+            { status: 200 },
+          );
+        }
+        return new Response("Not found", { status: 404 });
+      }) as typeof fetch;
+
+      const authUpstreamFromB = await checkAnnotationWorkspaceOwnership(
+        workspaceB,
+        "ann-upstream-test",
+      );
+      expect(authUpstreamFromB.authorized).toBe(false);
+      expect(authUpstreamFromB.reason).toContain("not authorized for workspace");
+
+      // Rightful Workspace A CAN authorize it
+      const authUpstreamFromA = await checkAnnotationWorkspaceOwnership(
+        workspaceA,
+        "ann-upstream-test",
+      );
+      expect(authUpstreamFromA.authorized).toBe(true);
+      expect(authUpstreamFromA?.upstreamAnnotationId).toBe("ann-upstream-test");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("Strict session validation rejects empty objects, missing id, and accepts verified envelopes", async () => {
+    const provider = new AgentationProvider();
+    provider.setContext(workspaceA);
+
+    const origFetch = globalThis.fetch;
+    try {
+      // 1. Empty JSON object {} must be rejected as malformed
+      globalThis.fetch = (async () => {
+        return new Response(JSON.stringify({}), { status: 200 });
+      }) as typeof fetch;
+      const resEmpty = await provider.validateSession("sess-any");
+      expect(resEmpty.status).toBe("malformed");
+      expect(resEmpty.reason).toContain("missing required non-empty \"id\" field");
+
+      // 2. Object with only status (missing id)
+      globalThis.fetch = (async () => {
+        return new Response(JSON.stringify({ status: "active", url: "http://localhost:3000" }), {
+          status: 200,
+        });
+      }) as typeof fetch;
+      const resNoId = await provider.validateSession("sess-any");
+      expect(resNoId.status).toBe("malformed");
+
+      // 3. Object with empty id string
+      globalThis.fetch = (async () => {
+        return new Response(JSON.stringify({ id: "   " }), { status: 200 });
+      }) as typeof fetch;
+      const resBlankId = await provider.validateSession("sess-any");
+      expect(resBlankId.status).toBe("malformed");
+
+      // 4. HTTP 401/403
+      globalThis.fetch = (async () => {
+        return new Response("Unauthorized", { status: 401 });
+      }) as typeof fetch;
+      const res401 = await provider.validateSession("sess-any");
+      expect(res401.status).toBe("server-error");
+      expect((res401 as any).statusCode).toBe(401);
+
+      // 5. Verified envelope { session: { id: "sess-env" } }
+      globalThis.fetch = (async () => {
+        return new Response(
+          JSON.stringify({ session: { id: "sess-env", status: "active" } }),
+          { status: 200 },
+        );
+      }) as typeof fetch;
+      const resEnv = await provider.validateSession("sess-env");
+      expect(resEnv.status).toBe("valid");
+
+      // 6. Verified envelope { data: { id: "sess-data" } }
+      globalThis.fetch = (async () => {
+        return new Response(
+          JSON.stringify({ data: { id: "sess-data", url: "http://localhost:3000" } }),
+          { status: 200 },
+        );
+      }) as typeof fetch;
+      const resData = await provider.validateSession("sess-data");
+      expect(resData.status).toBe("valid");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("SSE delivery fails closed on malformed payload or cross-workspace ownership", () => {
+    const dbA = getDb(workspaceA);
+    const dbB = getDb(workspaceB);
+
+    dbSaveSessionMapping(dbA, "session-sse-a", "client-a", workspaceA);
+    dbSaveSessionMapping(dbB, "session-sse-b", "client-b", workspaceB);
+
+    const providerA = new AgentationProvider();
+    providerA.setContext(workspaceA);
+
+    let callbackCalled = false;
+    const callback = () => {
+      callbackCalled = true;
+    };
+
+    // 1. Malformed payload (array or string instead of object)
+    const malformedPayloadEvent = {
+      type: "annotation.created",
+      sessionId: "session-sse-a",
+      payload: "just a string",
+    };
+    expect(providerA.processSSEEvent(malformedPayloadEvent as any, callback, "client-a")).toBe(false);
+    expect(callbackCalled).toBe(false);
+
+    // 2. Cross-workspace session: Workspace A receives an event from Workspace B's session
+    const crossWsEvent = {
+      type: "annotation.created",
+      sessionId: "session-sse-b",
+      payload: { id: "ann-b", comment: "From ws B" },
+    };
+    expect(providerA.processSSEEvent(crossWsEvent, callback, "client-a")).toBe(false);
+    expect(callbackCalled).toBe(false);
+
+    // 3. Legitimate event
+    const legitEvent = {
+      type: "annotation.created",
+      sessionId: "session-sse-a",
+      payload: { id: "ann-a", comment: "Legit event" },
+    };
+    expect(providerA.processSSEEvent(legitEvent, callback, "client-a")).toBe(true);
+    expect(callbackCalled).toBe(true);
   });
 });

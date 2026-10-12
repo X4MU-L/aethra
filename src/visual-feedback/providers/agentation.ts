@@ -32,7 +32,7 @@ import {
   getDb,
   dbGetSessionsForClient,
   dbSaveSessionMapping,
-  dbIsSessionMapped,
+  verifySessionAuthorization,
 } from "../../engine/db.js";
 
 // ─── Upstream annotation schema (Agentation API) ────────────────────────────
@@ -352,15 +352,38 @@ export class AgentationProvider extends VisualFeedbackProvider {
         };
       }
 
-      if (!data || typeof data !== "object") {
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
         return {
           status: "malformed",
           reason: "Agentation server returned unexpected non-object JSON response.",
         };
       }
 
-      const sessionObj = data as Record<string, unknown>;
-      if (sessionObj.id !== undefined && String(sessionObj.id) !== sessionId) {
+      // Handle direct session or envelope ({ session: ... } / { data: ... })
+      let sessionObj = data as Record<string, unknown>;
+      if (
+        sessionObj.session &&
+        typeof sessionObj.session === "object" &&
+        !Array.isArray(sessionObj.session)
+      ) {
+        sessionObj = sessionObj.session as Record<string, unknown>;
+      } else if (
+        sessionObj.data &&
+        typeof sessionObj.data === "object" &&
+        !Array.isArray(sessionObj.data) &&
+        (sessionObj.data as Record<string, unknown>).id
+      ) {
+        sessionObj = sessionObj.data as Record<string, unknown>;
+      }
+
+      if (!sessionObj.id || typeof sessionObj.id !== "string" || !sessionObj.id.trim()) {
+        return {
+          status: "malformed",
+          reason: `Agentation server returned session response missing required non-empty "id" field.`,
+        };
+      }
+
+      if (sessionObj.id !== sessionId) {
         return {
           status: "malformed",
           reason: `Agentation server returned mismatched session ID "${sessionObj.id}" (expected "${sessionId}").`,
@@ -526,7 +549,15 @@ export class AgentationProvider extends VisualFeedbackProvider {
     }
 
     const db = getDb(this.workspacePath);
-    const mappedSessionIds = dbGetSessionsForClient(db, clientSlug);
+    const mappedSessionIds = dbGetSessionsForClient(db, clientSlug).filter(
+      (sessionId) =>
+        verifySessionAuthorization(
+          sessionId,
+          clientSlug,
+          this.workspacePath!,
+          db,
+        ).authorized,
+    );
 
     if (mappedSessionIds.length === 0) {
       logger.debug(
@@ -792,7 +823,11 @@ export class AgentationProvider extends VisualFeedbackProvider {
       return false;
     }
 
-    const ann = (event.payload ?? event.annotation) as RawAnnotation;
+    const rawPayload = event.payload ?? event.annotation;
+    if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
+      return false;
+    }
+    const ann = rawPayload as RawAnnotation;
     const evSessionId =
       event.sessionId ?? ann.sessionId ?? ann._sessionId;
 
@@ -839,9 +874,15 @@ export class AgentationProvider extends VisualFeedbackProvider {
       }
 
       const db = getDb(this.workspacePath);
-      if (!dbIsSessionMapped(db, targetSessionId, clientSlug)) {
+      const auth = verifySessionAuthorization(
+        targetSessionId,
+        clientSlug,
+        this.workspacePath,
+        db,
+      );
+      if (!auth.authorized) {
         logger.debug(
-          `Agentation SSE: ignored annotation from session ${targetSessionId} (not mapped to client "${clientSlug}")`,
+          `Agentation SSE: ignored annotation from session ${targetSessionId} (not authorized for client "${clientSlug}": ${auth.reason})`,
         );
         return false;
       }

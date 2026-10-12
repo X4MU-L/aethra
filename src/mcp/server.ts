@@ -40,6 +40,7 @@ import {
   dbGetSessionsForClient,
   dbFindFeedbackByProviderAnnotation,
   dbUpdateFeedbackLifecycle,
+  verifySessionAuthorization,
 } from "../engine/db.js";
 
 // ─── Server setup ─────────────────────────────────────────────────────────────
@@ -992,19 +993,37 @@ function getWorkspaceSessionScope(): {
   clientSlug: string;
   mappedSessions: string[];
 } {
-  let clientSlug = "unknown";
+  const configPath = path.join(workspacePath, "client.yaml");
+  if (!fs.existsSync(configPath)) {
+    return { clientSlug: "", mappedSessions: [] };
+  }
+
+  let clientSlug = "";
   try {
-    const configPath = path.join(workspacePath, "client.yaml");
     const raw = fs.readFileSync(configPath, "utf8");
     const config = yaml.load(raw) as ClientConfig;
+    if (!config || !config.slug) {
+      return { clientSlug: "", mappedSessions: [] };
+    }
     clientSlug = config.slug;
   } catch {
-    // Fall through with unknown
+    return { clientSlug: "", mappedSessions: [] };
   }
 
   const db = getDb(workspacePath);
-  const mappedSessions = dbGetSessionsForClient(db, clientSlug);
-  return { clientSlug, mappedSessions };
+  const localSessions = dbGetSessionsForClient(db, clientSlug);
+  // Authoritative filter: every session MUST satisfy verifySessionAuthorization
+  const verifiedSessions = localSessions.filter((sessionId) => {
+    const auth = verifySessionAuthorization(
+      sessionId,
+      clientSlug,
+      workspacePath,
+      db,
+    );
+    return auth.authorized;
+  });
+
+  return { clientSlug, mappedSessions: verifiedSessions };
 }
 
 /** Verify that an annotation belongs to one of this workspace's mapped sessions. */
@@ -1017,6 +1036,13 @@ async function verifyAnnotationWorkspaceOwnership(
   localFeedbackId?: string;
 }> {
   const { clientSlug, mappedSessions } = getWorkspaceSessionScope();
+  if (!clientSlug) {
+    return {
+      authorized: false,
+      reason: "Workspace client configuration is invalid or missing",
+    };
+  }
+
   const db = getDb(workspacePath);
 
   // 1. Check local DB by provider annotation ID first
@@ -1060,13 +1086,23 @@ async function verifyAnnotationWorkspaceOwnership(
       };
     }
 
-    if (
-      mappedSessions.length === 0 ||
-      !mappedSessions.includes(localFb.sessionId)
-    ) {
+    const sessionAuth = verifySessionAuthorization(
+      localFb.sessionId,
+      clientSlug,
+      workspacePath,
+      db,
+    );
+    if (!sessionAuth.authorized) {
       return {
         authorized: false,
-        reason: `Annotation session "${localFb.sessionId}" is not mapped to workspace "${clientSlug}"`,
+        reason: `Annotation session "${localFb.sessionId}" is not authorized for workspace: ${sessionAuth.reason}`,
+      };
+    }
+
+    if (!mappedSessions.includes(localFb.sessionId)) {
+      return {
+        authorized: false,
+        reason: `Annotation session "${localFb.sessionId}" is not within active authorized workspace scope`,
       };
     }
 
@@ -1093,12 +1129,33 @@ async function verifyAnnotationWorkspaceOwnership(
       };
     }
     const ann = (await res.json()) as { sessionId?: string };
-    if (!ann.sessionId || !mappedSessions.includes(ann.sessionId)) {
+    if (!ann || typeof ann !== "object" || !ann.sessionId) {
       return {
         authorized: false,
-        reason: `Annotation ${annotationId} belongs to session ${ann.sessionId ?? "unknown"}, which is not mapped to workspace "${clientSlug}"`,
+        reason: `Annotation ${annotationId} response missing valid session identity`,
       };
     }
+
+    const sessionAuth = verifySessionAuthorization(
+      ann.sessionId,
+      clientSlug,
+      workspacePath,
+      db,
+    );
+    if (!sessionAuth.authorized) {
+      return {
+        authorized: false,
+        reason: `Annotation ${annotationId} belongs to session "${ann.sessionId}", which is not authorized for workspace "${clientSlug}": ${sessionAuth.reason}`,
+      };
+    }
+
+    if (!mappedSessions.includes(ann.sessionId)) {
+      return {
+        authorized: false,
+        reason: `Annotation ${annotationId} belongs to session "${ann.sessionId}", which is not within active workspace scope`,
+      };
+    }
+
     return {
       authorized: true,
       upstreamAnnotationId: annotationId,
@@ -1115,7 +1172,7 @@ async function verifyAnnotationWorkspaceOwnership(
 export async function checkAnnotationWorkspaceOwnership(
   targetWorkspacePath: string,
   annotationId: string,
-): Promise<{ authorized: boolean; reason?: string }> {
+): Promise<{ authorized: boolean; reason?: string, upstreamAnnotationId?: string }> {
   const prevWp = workspacePath;
   try {
     workspacePath = targetWorkspacePath;

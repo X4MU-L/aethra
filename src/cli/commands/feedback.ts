@@ -567,7 +567,7 @@ export function registerFeedbackCommand(program: Command): void {
                 logger.warn(
                   `Mapped session "${existingId}" is confirmed stale (HTTP 404 upstream); cleaning up.`,
                 );
-                dbRemoveSessionMapping(db, existingId, config.slug);
+                dbRemoveSessionMapping(db, existingId, config.slug, workspacePath);
               } else {
                 const reason = typeof v === "object" && v?.reason ? v.reason : status;
                 sessionNote = `Mapped session "${existingId}" cannot be verified upstream (${reason}). Start the watcher or check server connectivity.`;
@@ -937,7 +937,7 @@ export function registerFeedbackCommand(program: Command): void {
                   logger.warn(
                     `Mapped session "${existingId}" is confirmed stale (HTTP 404 upstream); cleaning up.`,
                   );
-                  dbRemoveSessionMapping(db, existingId, slug);
+                  dbRemoveSessionMapping(db, existingId, slug, workspacePath);
                 } else {
                   hasTransientErrors = true;
                   const reason =

@@ -13,7 +13,13 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import path from "path";
 import os from "os";
 import fs from "fs-extra";
-import { getDb, closeDb, dbSaveSessionMapping } from "../../src/engine/db.js";
+import {
+  getDb,
+  closeDb,
+  dbSaveSessionMapping,
+  setGlobalRegistryPath,
+  clearGlobalRegistry,
+} from "../../src/engine/db.js";
 import {
   testFetchScopedPendingAnnotations,
   testHandleGetPendingAnnotations,
@@ -23,14 +29,22 @@ describe("MCP Pending Annotation Observability", () => {
   let tmpRoot: string;
   let workspace: string;
   let origFetch: typeof globalThis.fetch;
+  let origAethraHome: string | undefined;
 
   beforeEach(async () => {
+    origAethraHome = process.env.AETHRA_HOME;
     tmpRoot = path.join(
       os.tmpdir(),
       `aethra-mcp-obs-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     );
     workspace = path.join(tmpRoot, "client-x");
+    const aethraHome = path.join(tmpRoot, ".aethra");
+    process.env.AETHRA_HOME = aethraHome;
+
     await fs.ensureDir(workspace);
+    await fs.ensureDir(aethraHome);
+
+    setGlobalRegistryPath(path.join(aethraHome, "session-registry.db"));
 
     await fs.writeFile(
       path.join(workspace, "client.yaml"),
@@ -43,6 +57,13 @@ describe("MCP Pending Annotation Observability", () => {
   afterEach(async () => {
     globalThis.fetch = origFetch;
     closeDb(workspace);
+    clearGlobalRegistry();
+    setGlobalRegistryPath(null);
+    if (origAethraHome !== undefined) {
+      process.env.AETHRA_HOME = origAethraHome;
+    } else {
+      delete process.env.AETHRA_HOME;
+    }
     await fs.remove(tmpRoot);
   });
 
@@ -308,5 +329,24 @@ describe("MCP Pending Annotation Observability", () => {
     expect(parsed.partial).toBe(true);
     expect(parsed.failedSessions).toHaveLength(1);
     expect(parsed.failedSessions[0].sessionId).toBe("session-watch-error");
+  });
+
+  it("unauthorized local legacy mapping is filtered out and never queried upstream", async () => {
+    const db = getDb(workspace);
+    // Directly insert row into session_mappings without global claim
+    db.prepare(
+      "INSERT OR REPLACE INTO session_mappings VALUES ('session-unauthorized', 'client-x', ?, ?)",
+    ).run(workspace, new Date().toISOString());
+
+    let fetchCalled = false;
+    globalThis.fetch = (async () => {
+      fetchCalled = true;
+      return new Response(JSON.stringify([]), { status: 200 });
+    }) as typeof fetch;
+
+    const res = await testFetchScopedPendingAnnotations(workspace);
+    expect(res.annotations).toEqual([]);
+    expect(res.successSessions).toEqual([]);
+    expect(fetchCalled).toBe(false); // Invariant: never queried upstream!
   });
 });
